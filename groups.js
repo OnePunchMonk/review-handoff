@@ -263,23 +263,7 @@ function group(root, hunks, notes) {
   groups.sort((a, b) => a.rank - b.rank || b.hunks.length - a.hunks.length);
   // A hunk linked into a noted change is explained by that note; flag only what no note covers.
   for (const g of groups) for (const h of g.hunks) h.explained = !!h.note || g.key.startsWith("note:");
-  // Edges between groups, for the map: two groups are linked when their code is.
-  const gi = new Map();
-  groups.forEach((g, i) => g.hunks.forEach((h) => gi.set(h.i, i)));
-  const edgeMap = new Map();
-  for (const h of hunks)
-    for (const [j, e] of adj[h.i]) {
-      const a = gi.get(h.i);
-      const b = gi.get(j);
-      if (a === undefined || b === undefined || a >= b) continue;
-      const k = `${a}-${b}`;
-      const cur = edgeMap.get(k) || { a, b, w: 0, why: new Set() };
-      cur.w += e.w;
-      e.why.forEach((w) => cur.why.add(w));
-      edgeMap.set(k, cur);
-    }
-  const edges = [...edgeMap.values()].map((e) => ({ a: e.a, b: e.b, w: e.w, why: [...e.why].slice(0, 2) }));
-  return { groups, edges, total: hunks.length, unexplained: hunks.filter((h) => !h.explained && isCode(h.file)), graph: graph ? graph.file : null };
+  return { groups, total: hunks.length, unexplained: hunks.filter((h) => !h.explained && isCode(h.file)), graph: graph ? graph.file : null };
 }
 
 module.exports = { parseDiff, group };
