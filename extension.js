@@ -16,6 +16,7 @@ const tasks = require("./tasks");
 const skills = require("./skills");
 const groups = require("./groups");
 const sidebar = require("./sidebar");
+const agents = require("./agents");
 const os = require("os");
 
 const SCHEME = "review-base";
@@ -102,27 +103,14 @@ function terminal(name, env) {
   return t;
 }
 
-/**
- * Tools each headless job may use, approved up front so it never stops to ask.
- * Reading is open; writing is limited to .review/.
- */
-const READ_TOOLS = ["Read", "Grep", "Glob", "Skill", "Bash(git diff:*)", "Bash(git show:*)", "Bash(git log:*)", "Bash(git ls-files:*)", "Bash(ls:*)", "Bash(mv .review/:*)", "Edit(.review/**)"];
+/** Extra Claude Code tools per job (reading the repo and writing .review/ are always allowed). */
 const JOB_TOOLS = {
-  assess: [],
   diagram: ["Bash(cd:*)", "Bash(uv run python render_excalidraw.py:*)", "Bash(uv run --directory:*)"],
   codex: ["mcp__codex-cli__codex"],
   goldfish: ["Agent", "Task"],
   ponytail: ["Agent", "Task"],
 };
 const JOB_LABEL = { assess: "Reviewing", diagram: "Drawing", codex: "Codex reviewing", goldfish: "Goldfish reviewing", ponytail: "Ponytail reviewing", tests: "Testing on Modal" };
-
-/** A clean environment: a job started from inside a Claude session must not inherit its markers. */
-function jobEnv(extra) {
-  const home = os.homedir();
-  const env = { ...process.env, ...extra, PATH: [`${home}/.local/bin`, "/opt/homebrew/bin", "/usr/local/bin", process.env.PATH].join(":") };
-  for (const k of Object.keys(env)) if (k.startsWith("CLAUDE_CODE_") || k === "CLAUDECODE") delete env[k];
-  return env;
-}
 
 let jobStatus;
 function updateJobStatus() {
@@ -143,7 +131,9 @@ function runJob(id) {
   const log = path.join(logDir, `${id}.log`);
   let cmd;
   let args;
-  let env = jobEnv();
+  let env;
+  let prof;
+  let prompt;
   if (id === "tests") {
     const last = readJson(path.join(checksDir(), "tests.json"));
     const tests = { ...(last?.targets ? { targets: last.targets } : {}), ...(current.review.tests || {}) };
@@ -151,17 +141,16 @@ function runJob(id) {
     if (!targets.length) return vscode.window.showWarningMessage("Review Handoff: no test targets ticked.");
     cmd = modalBin();
     args = ["run", path.join(extPath, "modal_tests.py")];
-    env = jobEnv({ REVIEW_ROOT: root, REVIEW_TESTS: JSON.stringify({ ...tests, targets }) });
+    env = agents.env({ REVIEW_ROOT: root, REVIEW_TESTS: JSON.stringify({ ...tests, targets }) });
   } else {
     const what = id === "diagram" || id === "assess" ? id : `review-${id}`;
-    const prof = tasks.profile(cfg("jobProfile") || "claude-sonnet-medium");
-    cmd = claudeBin();
-    args = ["-p", `Use the review-handoff skill, job "${what}", for the review in ${root}. You are running headless: do not ask questions, and write only inside .review/.`,
-      "--allowedTools", ...READ_TOOLS, ...(JOB_TOOLS[id] || [])];
-    if (prof.cli === "claude") args.push("--model", prof.model, "--effort", prof.effort);
+    prof = tasks.profile(cfg("jobProfile") || "claude-sonnet-medium");
+    prompt = `Use the review-handoff skill (instructions: ${path.join(os.homedir(), ".claude", "skills", "review-handoff", "SKILL.md")}), job "${what}", for the review in ${root}. You are running headless: do not ask questions, and write only inside .review/.`;
   }
   const out = fs.openSync(log, "w");
-  const child = cp.spawn(cmd, args, { cwd: root, env, stdio: ["ignore", out, out] });
+  let child;
+  if (cmd) child = cp.spawn(cmd, args, { cwd: root, env, stdio: ["ignore", out, out] });
+  else ({ child } = agents.spawn(prof, prompt, { cwd: root, access: "review", claudeTools: JOB_TOOLS[id] || [], claudeBin: claudeBin(), stdout: out, stderr: out }));
   const job = { root, started: Date.now(), running: true, child, log };
   jobs.set(id, job);
   child.on("error", (e) => {

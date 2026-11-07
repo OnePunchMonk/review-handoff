@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.4.1
+- Model agnostic: the organiser, tasks and checks run on any profile (Claude Code, Codex, or any CLI through a command template). Pick the organiser on the Tasks board.
+
 ## 0.4.0
 - One screen instead of five tabs: summary, a map of the change, one line of checks, the current step, finish.
 - Concerns attach to the step whose code they are about.

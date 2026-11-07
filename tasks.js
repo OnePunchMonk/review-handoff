@@ -9,6 +9,7 @@ const path = require("path");
 const cp = require("child_process");
 const crypto = require("crypto");
 const skills = require("./skills");
+const agents = require("./agents");
 
 let deps; // {claudeBin, openReview, context}
 let board = null; // webview panel
@@ -32,7 +33,6 @@ const profiles = () => {
 const profile = (id) => profiles().find((p) => p.id === id) || profiles()[0];
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 const readJson = (f) => {
   try {
     return JSON.parse(fs.readFileSync(f, "utf8"));
@@ -130,22 +130,22 @@ function parseJson(text) {
   return JSON.parse(s.slice(a, b + 1));
 }
 
+/** The organiser can be any profile: Claude, Codex, or your own CLI. Picked on the board. */
+function organiserProfile() {
+  return profile(load().organiser || vscode.workspace.getConfiguration("reviewHandoff").get("organiserProfile") || "claude-sonnet-medium");
+}
+
 async function organise(dump) {
   if (organising || !dump.trim()) return;
   save((s) => (s.dump = dump));
   organising = { started: Date.now() };
   organiseError = "";
   render();
-  const p = profile(vscode.workspace.getConfiguration("reviewHandoff").get("organiserProfile") || "claude-sonnet-medium");
-  const args = ["-p", organisePrompt(dump), "--output-format", "json", "--allowedTools", "Read", "Grep", "Glob", "Bash(git log:*)", "Bash(git ls-files:*)"];
-  if (p.cli === "claude") args.push("--model", p.model, "--effort", p.effort);
-  const r = await run(deps.claudeBin(), args, { cwd: home, timeout: 10 * 60e3 });
+  const r = await agents.run(organiserProfile(), organisePrompt(dump), { cwd: home, access: "read", claudeBin: deps.claudeBin(), timeout: 10 * 60e3 });
   organising = null;
   try {
-    if (r.err && !r.out) throw new Error((r.errOut || r.err.message).trim().split("\n").pop());
-    const outer = JSON.parse(r.out);
-    if (outer.is_error) throw new Error(outer.result || "the organiser returned an error");
-    const res = parseJson(outer.result);
+    if (r.error) throw new Error(r.error);
+    const res = parseJson(r.text);
     const ids = new Set(profiles().map((x) => x.id));
     save((s) => {
       s.proposals = (res.tasks || []).map((t, i) => ({
@@ -193,12 +193,8 @@ function launch(t, dir) {
   vscode.window.terminals.find((x) => x.name === name)?.dispose();
   const term = vscode.window.createTerminal({ name, cwd: dir, iconPath: new vscode.ThemeIcon("tasklist") });
   // Each task works only in its own worktree, never in the main checkout.
-  let prompt = `You are working in a dedicated git worktree at ${dir} (branch task/${t.id}). Make all changes here only.\n\n${String(t.prompt).split(home + "/").join("").split(home).join(".")}`;
-  if (t.mode === "plan" && p.cli === "codex") prompt = `First reply with a short plan and wait for my go-ahead.\n\n${prompt}`;
-  const cmd =
-    p.cli === "codex"
-      ? `codex -m ${shq(p.model)} -c ${shq(`model_reasoning_effort="${p.effort}"`)} -s workspace-write -a on-request ${shq(prompt)}`
-      : `${shq(deps.claudeBin())} --model ${shq(p.model)} --effort ${shq(p.effort)}${t.mode === "plan" ? " --permission-mode plan" : ""} ${shq(prompt)}`;
+  const prompt = `You are working in a dedicated git worktree at ${dir} (branch task/${t.id}). Make all changes here only.\n\n${String(t.prompt).split(home + "/").join("").split(home).join(".")}`;
+  const cmd = agents.interactive(p, prompt, { cwd: dir, plan: t.mode === "plan", claudeBin: deps.claudeBin() });
   term.sendText(cmd);
   term.show(true);
 }
@@ -299,6 +295,7 @@ function tick() {
 
 async function onMessage(m) {
   if (m.type === "dump") save((s) => (s.dump = m.text));
+  if (m.type === "organiser") save((s) => (s.organiser = m.id));
   if (m.type === "organise") await organise(m.text);
   if (m.type === "prop") save((s) => Object.assign(s.proposals.find((p) => p.id === m.id) || {}, m.patch));
   if (m.type === "discard") save((s) => (s.proposals = [])) && render();
@@ -422,7 +419,7 @@ function render() {
 <h2><label for="dump">Dump</label></h2>
 <textarea id="dump" placeholder="Paste or type everything you need done, in any order. Bugs, ideas, review comments, half-thoughts.">${esc(s.dump)}</textarea>
 <div class="bar"><button class="primary" id="organise" ${organising ? "disabled" : ""}>${organising ? "Organising…" : s.proposals.length ? "Organise again" : "Organise into tasks"}</button>
-<span class="hint">${organising ? "An agent is reading the repo and splitting the dump. This takes a minute." : `Uses ${esc(profile(vscode.workspace.getConfiguration("reviewHandoff").get("organiserProfile") || "claude-sonnet-medium").label)}, read-only.`}</span></div>
+${organising ? `<span class="hint">${esc(organiserProfile().label)} is reading the repo and splitting the dump. This takes a minute.</span>` : `<label class="hint">with <select id="organiser" aria-label="Agent that organises the dump">${ps.map((x) => `<option value="${esc(x.id)}" ${x.id === organiserProfile().id ? "selected" : ""}>${esc(x.label)}</option>`).join("")}</select>, read-only</label>`}</div>
 ${organiseError ? `<p class="err" role="alert">${esc(organiseError)} <button id="retry">Try again</button></p>` : ""}
 ${organising ? `<h2>Proposed <span class="n">splitting the dump</span></h2><div class="grid" aria-busy="true">${"<div class=skel><i></i><i></i><i></i></div>".repeat(3)}</div>` : ""}
 
@@ -442,6 +439,7 @@ ${s.tasks.length ? s.tasks.map(task).join("") : `<p class="empty">No tasks yet. 
   const dump = document.getElementById('dump');
   dump.addEventListener('input', () => later('dump', () => vscode.postMessage({ type: 'dump', text: dump.value })));
   document.getElementById('organise').addEventListener('click', () => vscode.postMessage({ type: 'organise', text: dump.value }));
+  document.getElementById('organiser')?.addEventListener('change', (e) => vscode.postMessage({ type: 'organiser', id: e.target.value }));
   document.getElementById('retry')?.addEventListener('click', () => vscode.postMessage({ type: 'organise', text: dump.value }));
   document.getElementById('start')?.addEventListener('click', () => vscode.postMessage({ type: 'start' }));
   document.getElementById('discard')?.addEventListener('click', () => vscode.postMessage({ type: 'discard' }));

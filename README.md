@@ -57,7 +57,12 @@ terminal ── /review-handoff ──▶ .review/review.json ──▶ one scre
 
 Open **Tasks** from the sidebar. Dump everything you need done. An agent splits it into separate, reviewable tasks, flags anything unclear as a question, and recommends an agent and model for each one (for example Codex `gpt-5.6-luna` at low effort for a small fix, Claude Opus at high effort for a design call). Approve, and each task starts on its own branch, in its own worktree and terminal. Tasks show up as tabs in the review panel when they are ready.
 
-Agent profiles (CLI, model, effort) are a setting: `reviewHandoff.agentProfiles`.
+**Any agent.** Profiles pair a CLI with a model and effort: Claude Code, Codex, or any other CLI through a command template (`reviewHandoff.agentProfiles`). Pick the organiser on the board; set `reviewHandoff.jobProfile` for checks.
+
+```json
+{ "id": "gemini", "label": "Gemini CLI", "cli": "command", "model": "gemini-2.5-pro",
+  "command": ["gemini", "-m", "{model}", "-p", "{prompt}"] }
+```
 
 ## Skills, without remembering them
 

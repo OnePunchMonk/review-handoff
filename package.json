@@ -3,7 +3,7 @@
   "displayName": "Review Handoff",
   "description": "Review what coding agents change before it ships: grouped diffs with the why inline, independent reviewers, tests on Modal, and a checklist you hand back to Claude Code or Codex.",
   "publisher": "onepunchmonk",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -60,14 +60,12 @@
         "reviewHandoff.agentProfiles": {
           "type": "array",
           "default": [],
-          "markdownDescription": "Agent profiles (CLI + model + effort) the task organiser recommends from. Empty uses the built-in five. Each: `{id, label, cli: \"claude\"|\"codex\", model, effort, bestFor}`.",
+          "markdownDescription": "Agent profiles the extension can use for organising, tasks and checks. Empty uses the built-in five. Each: `{id, label, cli, model, effort, bestFor}` with `cli` set to `\"claude\"`, `\"codex\"`, or `\"command\"` for any other CLI, which then needs `command` (headless argv) and optionally `interactive` (argv for a task terminal), with `{prompt}`, `{model}`, `{effort}`, `{cwd}` placeholders. Example: `{\"id\":\"gemini\",\"label\":\"Gemini CLI\",\"cli\":\"command\",\"model\":\"gemini-2.5-pro\",\"command\":[\"gemini\",\"-m\",\"{model}\",\"-p\",\"{prompt}\"]}`.",
           "items": {
             "type": "object",
             "required": [
               "id",
-              "cli",
-              "model",
-              "effort"
+              "cli"
             ],
             "properties": {
               "id": {
@@ -79,7 +77,8 @@
               "cli": {
                 "enum": [
                   "claude",
-                  "codex"
+                  "codex",
+                  "command"
                 ]
               },
               "model": {
@@ -90,6 +89,18 @@
               },
               "bestFor": {
                 "type": "string"
+              },
+              "command": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "interactive": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
               }
             }
           }
@@ -97,12 +108,12 @@
         "reviewHandoff.organiserProfile": {
           "type": "string",
           "default": "claude-sonnet-medium",
-          "description": "Profile that splits a task dump into tasks (must be a claude profile)."
+          "description": "Default profile that splits a task dump into tasks (any profile; you can also pick it on the Tasks board)."
         },
         "reviewHandoff.jobProfile": {
           "type": "string",
           "default": "claude-sonnet-medium",
-          "description": "Profile for independent jobs: reviewers and the diagram."
+          "description": "Profile that runs checks and the diagram headless (any profile)."
         },
         "reviewHandoff.claudePath": {
           "type": "string",
