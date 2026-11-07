@@ -1,0 +1,4 @@
+.github/**
+.review/**
+*.vsix
+**/__pycache__/**

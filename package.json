@@ -1,0 +1,217 @@
+{
+  "name": "review-handoff",
+  "displayName": "Review Handoff",
+  "description": "Review what coding agents change before it ships: grouped diffs with the why inline, independent reviewers, tests on Modal, and a checklist you hand back to Claude Code or Codex.",
+  "publisher": "onepunchmonk",
+  "version": "0.3.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OnePunchMonk/review-handoff"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onUri",
+    "onView:reviewHandoff.home"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "reviewHandoff.open",
+        "title": "Review Handoff: Open Review",
+        "icon": "$(diff-multiple)"
+      },
+      {
+        "command": "reviewHandoff.tasks",
+        "title": "Review Handoff: Tasks",
+        "icon": "$(tasklist)"
+      },
+      {
+        "command": "reviewHandoff.summonSkill",
+        "title": "Review Handoff: Summon Skill",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "reviewHandoff.reply",
+        "title": "Send to agent",
+        "enablement": "!commentIsEmpty"
+      },
+      {
+        "command": "reviewHandoff.openRoot",
+        "title": "Review Handoff: Open This Review"
+      },
+      {
+        "command": "reviewHandoff.installSkill",
+        "title": "Review Handoff: Reinstall the Agent Skill (Claude Code and Codex)"
+      }
+    ],
+    "configuration": {
+      "title": "Review Handoff",
+      "properties": {
+        "reviewHandoff.autoOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open the review automatically when .review/review.json is written."
+        },
+        "reviewHandoff.agentProfiles": {
+          "type": "array",
+          "default": [],
+          "markdownDescription": "Agent profiles (CLI + model + effort) the task organiser recommends from. Empty uses the built-in five. Each: `{id, label, cli: \"claude\"|\"codex\", model, effort, bestFor}`.",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "cli",
+              "model",
+              "effort"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "cli": {
+                "enum": [
+                  "claude",
+                  "codex"
+                ]
+              },
+              "model": {
+                "type": "string"
+              },
+              "effort": {
+                "type": "string"
+              },
+              "bestFor": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "reviewHandoff.organiserProfile": {
+          "type": "string",
+          "default": "claude-sonnet-medium",
+          "description": "Profile that splits a task dump into tasks (must be a claude profile)."
+        },
+        "reviewHandoff.jobProfile": {
+          "type": "string",
+          "default": "claude-sonnet-medium",
+          "description": "Profile for independent jobs: reviewers and the diagram."
+        },
+        "reviewHandoff.claudePath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the claude CLI. Empty finds it."
+        },
+        "reviewHandoff.modalPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the modal CLI. Empty finds it."
+        }
+      }
+    },
+    "menus": {
+      "commands": [
+        {
+          "command": "reviewHandoff.reply",
+          "when": "false"
+        },
+        {
+          "command": "reviewHandoff.openRoot",
+          "when": "false"
+        }
+      ],
+      "comments/commentThread/context": [
+        {
+          "command": "reviewHandoff.reply",
+          "group": "inline",
+          "when": "commentController == reviewHandoff"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "reviewHandoff.tasks",
+          "when": "view == reviewHandoff.home",
+          "group": "navigation"
+        },
+        {
+          "command": "reviewHandoff.summonSkill",
+          "when": "view == reviewHandoff.home",
+          "group": "navigation"
+        },
+        {
+          "command": "reviewHandoff.open",
+          "when": "view == reviewHandoff.home",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "reviewHandoff.open",
+          "when": "isInDiffEditor || resourceScheme == review-base",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "reviewHandoff.summonSkill",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "reviewHandoff",
+          "title": "Review Handoff",
+          "icon": "media/activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "reviewHandoff": [
+        {
+          "id": "reviewHandoff.home",
+          "name": "Review",
+          "icon": "media/activity.svg"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "reviewHandoff.home",
+        "contents": "When your agent finishes a change, ask it for /review-handoff.\n[Open Tasks](command:reviewHandoff.tasks)\n[Summon a skill](command:reviewHandoff.summonSkill)"
+      }
+    ]
+  },
+  "icon": "media/icon.png",
+  "bugs": {
+    "url": "https://github.com/OnePunchMonk/review-handoff/issues"
+  },
+  "homepage": "https://github.com/OnePunchMonk/review-handoff#readme",
+  "categories": [
+    "AI",
+    "Other",
+    "SCM Providers"
+  ],
+  "keywords": [
+    "claude",
+    "claude code",
+    "codex",
+    "code review",
+    "agents",
+    "diff",
+    "pull request"
+  ],
+  "galleryBanner": {
+    "color": "#1f1f1f",
+    "theme": "dark"
+  }
+}
