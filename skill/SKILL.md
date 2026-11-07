@@ -1,19 +1,19 @@
 ---
 name: review-handoff
-description: Hand finished code changes to the user for review in VS Code, and run the review jobs the panel starts. Writes .review/review.json (short overview, deep dive, a "why" note per hunk, test targets) and opens VS Code, where the Review Handoff extension shows the diff with notes inline, independent reviewers (Codex, Goldfish/EGM, Ponytail), tests on Modal, an Excalidraw diagram, and a hand-back checklist. Use when the user asks to review changes in VS Code, for a review handoff, or says "/review-handoff"; when a prompt names a review-handoff job ("review-codex", "review-goldfish", "review-ponytail", "diagram", "answer"); when told to read .review/feedback.json; or when a task prompt says to hand off for review.
+description: Hand finished code changes to the user for review in VS Code, and run the review jobs the panel starts. Writes .review/review.json (short overview, deep dive, a "why" note per hunk, test targets) and opens VS Code, where the Review Handoff extension shows the diff with notes inline, independent reviewers (Codex, Goldfish/EGM, Ponytail), tests on Modal, an Excalidraw diagram, and a hand-back checklist. Use when the user asks to review changes in VS Code, for a review handoff, or says "/review-handoff"; when a prompt names a review-handoff job ("assess", "review-codex", "review-goldfish", "review-ponytail", "diagram", "answer"); when told to read .review/feedback.json; or when a task prompt says to hand off for review.
 ---
 
 # Review Handoff
 
-The user reviews your work in VS Code with the **Review Handoff** extension (`onepunchmonk.review-handoff`, source https://github.com/OnePunchMonk/review-handoff). The panel has five tabs:
+The user reviews your work in VS Code with the **Review Handoff** extension (`onepunchmonk.review-handoff`, source https://github.com/OnePunchMonk/review-handoff). It is one screen, top to bottom:
 
-| Tab | Shows | Fed by |
-|---|---|---|
-| Overview | next step, 70-word summary, files, check status, PR | `sections[0]`, `files` |
-| Deep dive | long-form sections, every note in reading order, Q&A | `sections[1:]`, `deepDive`, `notes[].detail`, `qa` |
-| Diagram | Excalidraw drawing of the change | job `diagram` |
-| Checks | Codex, Goldfish, Ponytail findings; tests on Modal CPU | jobs `review-*`, `tests` |
-| Hand back | tick what to fix, instructions, memory, Send / Approve & push | everything above |
+1. **Summary**: `sections[0]`, cut at 70 words.
+2. **Map**: one box per step. Steps are your notes (one note = one logical change), in `order`, with the code each one touches grouped under it.
+3. **Checks**: one line. "Run checks" starts jobs `assess`, `review-codex`, `review-goldfish`, `review-ponytail` and the Modal tests, headless.
+4. **The current step**: the note's `body`, its files, and only the concerns that point into its code. The user picks Looks good, Needs change or Question.
+5. **Finish**: concerns with no location, open PR threads, a free-text box, then Send or Approve & push.
+
+Long-form sections, `deepDive`, Q&A, the PR conversation and past rounds are folded under Details and History.
 
 There is also a **Tasks** board (dump, organise, approve, parallel worktrees) and a **Skills** summoner (⌥⌘K). The VS Code CLI is not on PATH: `C="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"`.
 
@@ -75,7 +75,7 @@ If the window was already open, saving `review.json` refreshes it. A task worktr
 
 ## 3. Jobs the panel starts
 
-Each job runs in a fresh Claude session in a VS Code terminal. The prompt is `Use the review-handoff skill, job "<job>", for the review in <root>.` Read `<root>/.review/review.json` for `base` and the files. Write the output atomically: write a temp file, then rename it.
+Each job runs headless (`claude -p`) with read access and write access to `.review/` only, so never ask questions and never write elsewhere. The prompt is `Use the review-handoff skill, job "<job>", for the review in <root>.` Read `<root>/.review/review.json` for `base` and the files. Write the output atomically: write a temp file, then rename it.
 
 Findings schema, written to `.review/checks/<reviewer>.json`:
 ```json
@@ -92,7 +92,13 @@ Use `must` only for a concrete bug, data loss or security issue. Report a findin
 
   Merge their findings into `checks/goldfish.json`. A false claim in the write-up is `must`.
 - **review-ponytail**: run the `ponytail-review` skill (from the ponytail plugin) on `git diff <base>` and untracked files, then convert each finding into the schema and write `checks/ponytail.json`. Map severity like this: their "must fix" becomes `must`, "should fix" becomes `should`, and "nice to have" or "cut" becomes `nit`.
-- **diagram**: use the `excalidraw-diagram` skill. Draw the change as before and after flow, with real function and message names, and only the parts the diff touches. Write `.review/diagram.excalidraw`, render it to `.review/diagram.png` with the skill's renderer, look at the image, and fix it until it is readable. Write the PNG last, because the panel refreshes when it lands.
+- **assess**: the senior-review scorecard. Fresh context: read `git diff <base>` (skip generated files), the code around it, the existing tests, and the write-up in `review.json` as claims to check, not facts. Answer each question in **one sentence** (under 25 words) with a verdict `ok`, `concern` or `unknown`, plus `refs` (`path:line`) and an optional short `detail` (3 lines max). Write `.review/checks/assess.json`:
+  ```json
+  { "summary": "one line", "questions": [
+    { "id": "why", "verdict": "ok|concern|unknown", "answer": "one sentence", "refs": ["path:line"], "detail": "optional" } ] }
+  ```
+  Question ids: `why` (is the reason real?), `approach` (why this way, what alternative was skipped), `arch` (what it changes in the architecture: new dependencies, layers, data flow), `simpler` (a smaller change that does the same?), `reuse` (does it duplicate a helper that exists? name it), `dead` (code left unused or unreachable by this change), `tests_missing` (risky new logic with no test), `tests_reuse` (existing test files or fixtures to extend instead of new ones), `tests_worth` (the one or two tests worth adding, concretely), `scale` (behaviour at real load or size), `maintain` (what will be hard to change later). `concern` needs a concrete case. Don't pad: when something is fine, say so in a few words.
+- **diagram**: use the `excalidraw-diagram` skill. Draw the change as before and after flow, with real function and message names, and only the parts the diff touches. Write `.review/diagram.excalidraw`, render it to `.review/diagram.png` with the skill's renderer, look at the image, and fix it until it is readable. Write the PNG last: it opens in the editor when it lands.
 - **answer**: you are the main agent session, so you have the context. Read `questions` in `feedback.json`, and for each one not already in `review.json` `qa`, add `{q, a}`, copying `q` exactly. Keep answers short. Link code as `` `path:line` ``. Save `review.json`.
 - **tests**: the extension runs this itself (`modal_tests.py`), and it writes `checks/tests.json`. It needs no agent.
 
@@ -102,7 +108,7 @@ The user presses **Send** and pastes the copied prompt to you. Read `<repo>/.rev
 
 ```json
 { "verdict": "request-changes|approve", "round": 2,
-  "todo": [{ "key": "...", "kind": "pr|check|you|change", "from": "@user|Codex|test failed|you|change",
+  "todo": [{ "key": "...", "kind": "step|review|pr|check|you", "files": ["for steps"], "from": "@user|Codex|test failed|you|change",
              "status": "...", "file": "...", "line": 0, "text": "...", "url": "...",
              "action": "fix|answer|change|test|revert", "note": "the user's how / what to test" }],
   "context": { "instructions": "...", "clarifications": "...", "remember": "..." },

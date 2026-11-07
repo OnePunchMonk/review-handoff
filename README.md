@@ -33,22 +33,23 @@ code --install-extension review-handoff-<version>.vsix
 Coding agents change a lot in one sweep, and the terminal shows you a wall of edits. You end up approving changes you never really read. Review Handoff makes the agent explain itself and gives you a review loop you control:
 
 - **Grouped changes.** Every changed block is grouped into the logical change it belongs to, across files, in reading order. Code that no explanation covers is flagged with `?`. With [Graphify](https://github.com/Graphify-Labs/graphify) installed, groups follow the real call graph.
-- **Short by design.** The summary is capped at 70 words and inline notes at 280 characters. Long explanations live in the Deep dive tab, where you can ask follow-up questions.
-- **Not just the agent's word.** Run independent reviewers: Codex (via its MCP server), a fresh-context Goldfish review in the [Elephant-Goldfish](https://github.com/google/elephant-goldfish-model) style that checks whether the write-up is true, and [Ponytail](https://github.com/DietrichGebert/ponytail). Run the targeted tests on Modal CPU. Findings land inline in the diff.
+- **One step at a time.** The summary is capped at 70 words, each step shows 1-2 sentences of why, and long explanations are folded under Details, where you can ask follow-up questions.
+- **Not just the agent's word.** One click runs independent checks headless: a senior-review scorecard, Codex (via its MCP server), a fresh-context Goldfish review in the [Elephant-Goldfish](https://github.com/google/elephant-goldfish-model) style, [Ponytail](https://github.com/DietrichGebert/ponytail), and your targeted tests on Modal CPU.
 - **You decide.** Tick what to fix, explain, test or revert, add instructions, clarifications and things to remember, then **Send**. Or **Approve & push**: it commits only the reviewed files and pushes the branch, after a confirm, never from main.
 - **Data stays out of the way.** Binary files and large generated dumps are set aside, and files the agent changed without mentioning are flagged.
 
 ## How it works
 
-```
-you ── ask ──▶ agent ── /review-handoff ──▶ .review/review.json ──▶ VS Code panel
- ▲                                                                     │
- └──── paste prompt ◀── .review/feedback.json ◀── Send / Approve & push┘
-```
+1. When a change is ready, ask your agent for **/review-handoff**. It writes `.review/review.json`: a short summary, one note per logical change, test targets. VS Code opens the review.
+2. One screen beside the diff: the summary, a **map** of the change (one box per step), one line of checks, and the **current step**. Each step shows its why, its code on the left, and only the concerns found in that code. Mark it *Looks good*, *Needs change* or *Question* and move on (`j`/`k`, `g`/`c`/`q`).
+3. **Run checks** runs everything in the background: a fresh-context review of reuse, dead code, missing tests, tests worth adding, architecture, simplicity, scale and maintenance; Codex; Goldfish; Ponytail; your tests on Modal. Nothing to watch, findings land on the step they belong to.
+4. **Send** writes `.review/feedback.json` and copies one line to paste into your agent, or **Approve & push**. Every round is kept under History with "Compare with now", so you see what the agent did with your feedback.
 
-1. When a change is ready, ask your agent for **/review-handoff**. It writes `.review/review.json` (summary, a note per logical change, test targets) and opens VS Code.
-2. The panel opens beside the diff with five tabs: **Overview**, **Deep dive**, **Diagram** (Excalidraw), **Checks**, **Hand back**. Click into a change to see its note under the code. Reply there, or comment on any line.
-3. **Send** writes `.review/feedback.json` and copies one line to paste into your agent. It does only what you ticked, then hands back a fresh review.
+```
+terminal ── /review-handoff ──▶ .review/review.json ──▶ one screen in VS Code
+   ▲                                                         │
+   └── paste one line ◀── .review/feedback.json ◀── Send ─────┘
+```
 
 `.review/` is added to `.git/info/exclude` and never committed.
 

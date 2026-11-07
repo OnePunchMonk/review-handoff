@@ -47,22 +47,8 @@ let extPath = "";
 //    terminal and writes .review/checks/<id>.json or .review/diagram.*,
 //    which the panel picks up when it lands.
 
-const REVIEWERS = {
-  codex: {
-    name: "Codex",
-    blurb: "A second model reviews the diff, via the Codex MCP server.",
-  },
-  goldfish: {
-    name: "Goldfish",
-    blurb: "Fresh-context reviewers see only the diff and this write-up: do the claims hold, is it clear? (Elephant-Goldfish Model)",
-    plugin: { id: "egm", label: "EGM", cmds: ["claude plugin marketplace add google/elephant-goldfish-model", "claude plugin install egm@egm"], without: "Without EGM it runs plain fresh-context subagents." },
-  },
-  ponytail: {
-    name: "Ponytail",
-    blurb: "Senior-dev review: bugs, risk, load, missing tests, and what to cut.",
-    plugin: { id: "ponytail", label: "Ponytail", cmds: ["claude plugin marketplace add DietrichGebert/ponytail", "claude plugin install ponytail@ponytail"], without: "Needs the Ponytail plugin." },
-  },
-};
+/** Independent reviewers; the review-handoff skill defines what each job does. */
+const REVIEWERS = { codex: { name: "Codex" }, goldfish: { name: "Goldfish" }, ponytail: { name: "Ponytail" } };
 const SEV = { must: "must fix", should: "should fix", nit: "nit" };
 const jobs = new Map(); // job id -> {started, terminal}
 let plugins = null; // Set of installed Claude Code plugin ids, null until known
@@ -98,14 +84,10 @@ function readCheck(id) {
 
 function jobState(id) {
   const j = jobs.get(id);
+  if (j && j.root === current.root && j.running) return "running";
+  if (j && j.root === current.root && j.error) return "failed";
   const file = id === "diagram" ? path.join(current.root, ".review", "diagram.png") : path.join(checksDir(), `${id}.json`);
-  let mtime = 0;
-  try {
-    mtime = fs.statSync(file).mtimeMs;
-  } catch {}
-  if (id === "tests" && readJson(file)?.running) return "running";
-  if (j && j.root === current.root && mtime < j.started && !j.closed) return "running";
-  return mtime ? "done" : "never";
+  return fs.existsSync(file) ? "done" : "never";
 }
 
 function shq(s) {
@@ -120,36 +102,98 @@ function terminal(name, env) {
   return t;
 }
 
-/** Independent jobs run in their own terminal so the user can watch and approve tool use. */
+/**
+ * Tools each headless job may use, approved up front so it never stops to ask.
+ * Reading is open; writing is limited to .review/.
+ */
+const READ_TOOLS = ["Read", "Grep", "Glob", "Skill", "Bash(git diff:*)", "Bash(git show:*)", "Bash(git log:*)", "Bash(git ls-files:*)", "Bash(ls:*)", "Bash(mv .review/:*)", "Edit(.review/**)"];
+const JOB_TOOLS = {
+  assess: [],
+  diagram: ["Bash(cd:*)", "Bash(uv run python render_excalidraw.py:*)", "Bash(uv run --directory:*)"],
+  codex: ["mcp__codex-cli__codex"],
+  goldfish: ["Agent", "Task"],
+  ponytail: ["Agent", "Task"],
+};
+const JOB_LABEL = { assess: "Reviewing", diagram: "Drawing", codex: "Codex reviewing", goldfish: "Goldfish reviewing", ponytail: "Ponytail reviewing", tests: "Testing on Modal" };
+
+/** A clean environment: a job started from inside a Claude session must not inherit its markers. */
+function jobEnv(extra) {
+  const home = os.homedir();
+  const env = { ...process.env, ...extra, PATH: [`${home}/.local/bin`, "/opt/homebrew/bin", "/usr/local/bin", process.env.PATH].join(":") };
+  for (const k of Object.keys(env)) if (k.startsWith("CLAUDE_CODE_") || k === "CLAUDECODE") delete env[k];
+  return env;
+}
+
+let jobStatus;
+function updateJobStatus() {
+  const running = [...jobs.entries()].filter(([, j]) => j.running);
+  if (!jobStatus) return;
+  if (!running.length) return jobStatus.hide();
+  jobStatus.text = `$(sync~spin) ${running.map(([id]) => JOB_LABEL[id] || id).join(", ")}`;
+  jobStatus.show();
+}
+
+/** Independent jobs run headless: no terminal, no prompts. The panel shows progress and the result. */
 function runJob(id) {
   if (!current) return;
   const root = current.root;
-  let t;
+  if (jobs.get(id)?.running) return;
+  const logDir = path.join(root, ".review", "jobs");
+  fs.mkdirSync(logDir, { recursive: true });
+  const log = path.join(logDir, `${id}.log`);
+  let cmd;
+  let args;
+  let env = jobEnv();
   if (id === "tests") {
-    const tests = { ...(readJson(path.join(checksDir(), "tests.json")) ? { targets: readJson(path.join(checksDir(), "tests.json")).targets } : {}), ...(current.review.tests || {}) };
-    const off = new Set(loadFeedback().testsOff || []);
-    const targets = (tests.targets || []).filter((x) => !off.has(x));
+    const last = readJson(path.join(checksDir(), "tests.json"));
+    const tests = { ...(last?.targets ? { targets: last.targets } : {}), ...(current.review.tests || {}) };
+    const targets = tests.targets || [];
     if (!targets.length) return vscode.window.showWarningMessage("Review Handoff: no test targets ticked.");
-    t = terminal("Review · tests (Modal)", { REVIEW_ROOT: root, REVIEW_TESTS: JSON.stringify({ ...tests, targets }) });
-    t.sendText(`${shq(modalBin())} run ${shq(path.join(extPath, "modal_tests.py"))}`);
+    cmd = modalBin();
+    args = ["run", path.join(extPath, "modal_tests.py")];
+    env = jobEnv({ REVIEW_ROOT: root, REVIEW_TESTS: JSON.stringify({ ...tests, targets }) });
   } else {
-    const what = id === "diagram" ? "diagram" : `review-${id}`;
-    const label = id === "diagram" ? "diagram" : REVIEWERS[id].name;
-    t = terminal(`Review · ${label}`);
+    const what = id === "diagram" || id === "assess" ? id : `review-${id}`;
     const prof = tasks.profile(cfg("jobProfile") || "claude-sonnet-medium");
-    const flags = prof.cli === "claude" ? ` --model ${shq(prof.model)} --effort ${shq(prof.effort)}` : "";
-    t.sendText(`${shq(claudeBin())}${flags} ${shq(`Use the review-handoff skill, job "${what}", for the review in ${root}.`)}`);
+    cmd = claudeBin();
+    args = ["-p", `Use the review-handoff skill, job "${what}", for the review in ${root}. You are running headless: do not ask questions, and write only inside .review/.`,
+      "--allowedTools", ...READ_TOOLS, ...(JOB_TOOLS[id] || [])];
+    if (prof.cli === "claude") args.push("--model", prof.model, "--effort", prof.effort);
   }
-  jobs.set(id, { root, started: Date.now(), terminal: t });
+  const out = fs.openSync(log, "w");
+  const child = cp.spawn(cmd, args, { cwd: root, env, stdio: ["ignore", out, out] });
+  const job = { root, started: Date.now(), running: true, child, log };
+  jobs.set(id, job);
+  child.on("error", (e) => {
+    fs.appendFileSync(log, `\n${e.message}\n`);
+  });
+  child.on("close", (code) => {
+    fs.closeSync(out);
+    job.running = false;
+    job.code = code;
+    const produced = id === "diagram" ? path.join(root, ".review", "diagram.png") : path.join(root, ".review", "checks", `${id}.json`);
+    const fresh = fs.existsSync(produced) && fs.statSync(produced).mtimeMs >= job.started;
+    if (fresh && id === "diagram") vscode.commands.executeCommand("vscode.open", vscode.Uri.file(produced), { viewColumn: vscode.ViewColumn.One });
+    if (!fresh && !job.cancelled) {
+      const tail = (fs.readFileSync(log, "utf8").trim().split("\n").pop() || `exit ${code}`).slice(0, 200);
+      job.error = tail;
+    }
+    updateJobStatus();
+    if (current && current.root === root) {
+      addCheckThreads();
+      rerender();
+    }
+  });
+  updateJobStatus();
   rerender();
 }
 
-function installPlugin(id) {
-  const p = REVIEWERS[id]?.plugin;
-  if (!p) return;
-  const t = terminal(`Install ${p.label}`);
-  t.sendText(p.cmds.map((c) => c.replace(/^claude /, `${shq(claudeBin())} `)).join(" && "));
-  jobs.set(`install:${id}`, { root: current.root, started: Date.now(), terminal: t });
+function cancelJob(id) {
+  const j = jobs.get(id);
+  if (j?.running) {
+    j.cancelled = true;
+    j.child.kill("SIGTERM");
+  }
 }
 
 function addCheckThreads() {
@@ -426,7 +470,7 @@ const clip = (s, max) => (s.length <= max ? s : s.slice(0, max).replace(/\s+\S*$
 const noteComment = (n) => {
   const body = String(n.body || "");
   const more = body.length > NOTE_MAX || n.detail;
-  return { body: md(clip(body, NOTE_MAX) + (more ? "\n\n*More in the Deep dive tab.*" : "")), mode: vscode.CommentMode.Preview, author: { name: "Why" }, contextValue: "note" };
+  return { body: md(clip(body, NOTE_MAX) + (more ? "\n\n*More in the review panel.*" : "")), mode: vscode.CommentMode.Preview, author: { name: "Why" }, contextValue: "note" };
 };
 const userComment = (text) => ({ body: md(text), mode: vscode.CommentMode.Preview, author: { name: "You" } });
 
@@ -599,26 +643,23 @@ function showPanel() {
       if (msg.type === "refreshPr") refreshPr();
       if (msg.type === "run") {
         if (msg.id !== "all") runJob(msg.id);
-        else for (const id of [...Object.keys(REVIEWERS), "tests"]) {
-          const r = REVIEWERS[id];
-          const lastRun = readJson(path.join(checksDir(), "tests.json"));
-          const blocked = (r?.plugin && plugins && !plugins.has(r.plugin.id) && id === "ponytail") || (id === "tests" && !(current.review.tests?.targets || lastRun?.targets || []).length);
-          if (!blocked && jobState(id) !== "running") runJob(id);
+        else {
+          const hasTests = (current.review.tests?.targets || readJson(path.join(checksDir(), "tests.json"))?.targets || []).length;
+          for (const id of ["assess", "codex", "goldfish", "ponytail", "tests"]) {
+            if (id === "ponytail" && plugins && !plugins.has("ponytail")) continue;
+            if (id === "tests" && !hasTests) continue;
+            if (jobState(id) !== "running") runJob(id);
+          }
         }
       }
-      if (msg.type === "install") installPlugin(msg.id);
-      if (msg.type === "diagramOpen") openDiagram(msg.what);
-      if (msg.type === "testOn") saveFeedback((fb) => {
-        const off = new Set(fb.testsOff || []);
-        msg.on ? off.delete(msg.target) : off.add(msg.target);
-        fb.testsOff = [...off];
-      });
+      if (msg.type === "cancel") (msg.id === "all" ? [...jobs.keys()] : [msg.id]).forEach(cancelJob);
+      if (msg.type === "round") compareRound(msg.n);
+      if (msg.type === "log") {
+        const j = jobs.get(msg.id);
+        if (j?.log) vscode.window.showTextDocument(vscode.Uri.file(j.log), { preview: true, viewColumn: vscode.ViewColumn.One });
+      }
       if (msg.type === "ask") askQuestion(msg.q);
       if (msg.type === "switchTask") openReview(msg.root, { force: true });
-      if (msg.type === "group") {
-        const g = current.analysis?.groups[msg.i];
-        if (g) vscode.commands.executeCommand("vscode.changes", `Group: ${g.title}`, groupResources(g));
-      }
       if (msg.type === "graphify") {
         const bin = findBin("graphify");
         const t = terminal("Review · Graphify");
@@ -636,23 +677,14 @@ function showPanel() {
   panel.webview.html = renderHtml();
 }
 
-const EXCALIDRAW_EXT = "pomdtr.excalidraw-editor";
-
 /** One chip per task that has a review, so you can move between parallel tasks. */
+/** Parallel tasks as chips, so you can move between their reviews; plus Tasks and Skills. */
 function taskStrip() {
-  const items = tasks.strip(current.root);
-  const chips = items
-    .map((t) => `<button class="task ${t.root === current.root ? "on" : ""}" data-root="${esc(t.root)}" title="${esc(t.status)}">${esc(t.title)}${t.status === "ready for review" ? " ●" : ""}</button>`)
+  const chips = tasks
+    .strip(current.root)
+    .map((t) => `<button class="chip ${t.root === current.root ? "on" : ""}" data-root="${esc(t.root)}" title="${esc(t.status)}">${esc(t.title)}</button>`)
     .join("");
-  return `<div class="strip">${chips}<span class="sp"></span><button class="task" data-tasks title="Tasks board">Tasks</button><button class="task" data-summon title="Summon a skill (⌥⌘K)">Skills</button></div>`;
-}
-
-async function openDiagram(what) {
-  const dir = path.join(current.root, ".review");
-  if (what === "install") return vscode.commands.executeCommand("workbench.extensions.search", EXCALIDRAW_EXT);
-  const file = path.join(dir, what === "png" ? "diagram.png" : "diagram.excalidraw");
-  if (!fs.existsSync(file)) return vscode.window.showWarningMessage(`Review Handoff: ${path.basename(file)} not found.`);
-  await vscode.commands.executeCommand("vscode.open", vscode.Uri.file(file), { viewColumn: vscode.ViewColumn.One });
+  return `${chips}<button class="chip" data-tasks>Tasks</button><button class="chip" data-summon title="Summon a skill (⌥⌘K)">Skills</button>`;
 }
 
 /** Deep-dive questions need the agent's context, so they go to the user's own session. */
@@ -741,13 +773,6 @@ function mdHtml(src) {
 
 // --------------------------------------------------------------- hand-back
 
-const ACTIONS = {
-  pr: [["fix", "Fix"], ["answer", "Explain / answer"], ["skip", "Skip"]],
-  you: [["fix", "Fix"], ["answer", "Explain / answer"], ["skip", "Skip"]],
-  check: [["fix", "Fix"], ["answer", "Explain why not"], ["skip", "Skip"]],
-  change: [["keep", "Keep"], ["explain", "Explain it"], ["change", "Change it"], ["test", "Add / extend test"], ["revert", "Revert"]],
-};
-let lastItems = [];
 
 /** Everything the user can tick: PR threads, reviewer findings, failing tests, their own comments, each change. */
 function buildItems(fb) {
@@ -795,40 +820,79 @@ function buildItems(fb) {
   return items;
 }
 
-function handbackHtml(fb) {
-  lastItems = buildItems(fb);
-  const ctx = fb.context || {};
-  const ref = (it) => (it.file ? `<a class="ref" data-file="${esc(it.file)}" data-line="${it.line || 1}">${esc(path.basename(it.file))}:${it.line || 1}</a>` : "");
-  const row = (it) => `<div class="item ${it.checked ? "" : "off"}" data-key="${esc(it.key)}">
-      <input type="checkbox" class="on" ${it.checked ? "checked" : ""} aria-label="act on this">
-      <div class="item-main">
-        <div><span class="tag ${it.kind} ${it.status === "open" || it.sev === "must" ? "hot" : ""}">${esc(it.label)}${it.status ? ` · ${esc(it.status)}` : ""}</span>${ref(it)}</div>
-        <div class="first">${inline(String(it.text).replace(/\n+/g, " "))}</div>
-        ${it.done ? `<div class="done">✓ Done: ${inline(it.done)}</div>` : ""}
-        ${it.why ? `<div class="why">Agent: ${inline(it.why)}</div>` : ""}
-        <div class="ctl"><select class="act" aria-label="action">${ACTIONS[it.kind].map(([v, l]) => `<option value="${v}" ${v === it.action ? "selected" : ""}>${l}</option>`).join("")}</select>
-        <input class="note" placeholder="how / what to test (optional)" value="${esc(it.note)}"></div>
-      </div></div>`;
-  const groups = [
-    ["PR comments", lastItems.filter((i) => i.kind === "pr")],
-    ["Reviewers and tests", lastItems.filter((i) => i.kind === "check")],
-    ["Your comments", lastItems.filter((i) => i.kind === "you")],
-    ["Changes", lastItems.filter((i) => i.kind === "change")],
-  ]
-    .filter(([, l]) => l.length)
-    .map(([h, l]) => `<details class="grp" ${l.some((i) => i.checked) || h === "PR comments" ? "open" : ""}><summary>${h} <span class="small">${l.filter((i) => i.checked).length}/${l.length} ticked</span></summary>${l.map(row).join("")}</details>`)
-    .join("");
-  const n = lastItems.filter((i) => i.checked && !["skip", "keep"].includes(i.action)).length;
-  return `<div class="small">Round ${(fb.round || 0) + 1}. Tick what the agent should act on and choose how. Everything saves as you go.</div>
-  ${groups || `<p class="small">Nothing to act on yet.</p>`}
-  <label class="lbl" for="ctx-instructions">Instructions for this round</label>
-  <textarea class="ctx" id="ctx-instructions" data-k="instructions" placeholder="e.g. keep the fix minimal, don't touch the gateway">${esc(ctx.instructions || "")}</textarea>
-  <label class="lbl" for="ctx-clarifications">Clarifications</label>
-  <textarea class="ctx" id="ctx-clarifications" data-k="clarifications" placeholder="Answers to open questions, or what the task really is">${esc(ctx.clarifications || "")}</textarea>
-  <label class="lbl" for="ctx-remember">Remember for future sessions</label>
-  <textarea class="ctx" id="ctx-remember" data-k="remember" placeholder="One per line. The agent saves these to its memory.">${esc(ctx.remember || "")}</textarea>
-  <div class="row"><button class="primary" id="send">Send ${n} to agent</button><button data-v="approve" title="Commit the reviewed files and push this branch (asks first)">Approve &amp; push</button></div>
-  <div class="small" id="sent">${fb.pushed ? `Pushed ${esc(fb.pushed.sha)} to ${esc(fb.pushed.remote)}/${esc(fb.pushed.branch)} · ` : ""}${fb.submittedAt ? `Last sent ${esc(fb.submittedAt.slice(0, 16).replace("T", " "))}` : ""}</div>`;
+// ---------------------------------------------------------------- history
+//
+// Each Send or Approve & push saves the round: what you reviewed (code snapshot via
+// `git stash create`, kept alive by refs/review-handoff/round-N), the write-up, your
+// feedback, checks and diagram. "Compare with now" shows what the agent did with it.
+
+function historyDir() {
+  return path.join(current.root, ".review", "history");
+}
+
+async function snapshotRound(fb, kind) {
+  const root = current.root;
+  const n = fb.round || 1;
+  const dir = path.join(historyDir(), String(n));
+  fs.mkdirSync(path.join(dir, "checks"), { recursive: true });
+  const copy = (from, to) => {
+    try {
+      fs.copyFileSync(from, to);
+    } catch {}
+  };
+  copy(path.join(root, REVIEW_FILE), path.join(dir, "review.json"));
+  copy(feedbackPath(), path.join(dir, "feedback.json"));
+  copy(path.join(root, ".review", "diagram.png"), path.join(dir, "diagram.png"));
+  try {
+    for (const f of fs.readdirSync(checksDir())) copy(path.join(checksDir(), f), path.join(dir, "checks", f));
+  } catch {}
+  const sha = ((await git(root, ["stash", "create"])) || "").trim() || ((await git(root, ["rev-parse", "HEAD"])) || "").trim();
+  if (sha) await git(root, ["update-ref", `refs/review-handoff/round-${n}`, sha]);
+  const a = readAssessment();
+  const t = readJson(path.join(checksDir(), "tests.json"));
+  fs.writeFileSync(
+    path.join(dir, "meta.json"),
+    JSON.stringify({ round: n, kind, at: new Date().toISOString(), sha, title: current.review.title, asked: (fb.todo || []).map((x) => x.text), concerns: a ? a.rows.filter((r) => r.verdict === "concern").length : null, tests: t && !t.running ? `${t.passed} passed${t.failed + t.errors ? `, ${t.failed + t.errors} failed` : ""}` : null, pushed: fb.pushed || null }, null, 2) + "\n"
+  );
+}
+
+function rounds() {
+  try {
+    return fs
+      .readdirSync(historyDir())
+      .map((d) => readJson(path.join(historyDir(), d, "meta.json")))
+      .filter(Boolean)
+      .sort((a, b) => b.round - a.round);
+  } catch {
+    return [];
+  }
+}
+
+async function compareRound(n) {
+  const m = rounds().find((r) => r.round === n);
+  if (!m?.sha) return;
+  const names = ((await git(current.root, ["diff", "--name-only", m.sha])) || "").split("\n").map((x) => x.trim()).filter((x) => x && !x.startsWith(".review/"));
+  if (!names.length) return vscode.window.showInformationMessage(`Nothing changed since round ${n}.`);
+  const res = names.map((f) => {
+    const abs = fileUri(f);
+    return [abs, baseUri(current.root, m.sha, f), fs.existsSync(abs.fsPath) ? abs : undefined];
+  });
+  await vscode.commands.executeCommand("vscode.changes", `Round ${n} → now`, res);
+}
+
+function historyHtml(webview) {
+  const rs = rounds();
+  if (!rs.length) return `<p class="small">Each time you send feedback or approve, the round is saved here, so you can see what the agent did with it.</p>`;
+  return `<ol class="hist">${rs
+    .map((r) => {
+      const png = path.join(historyDir(), String(r.round), "diagram.png");
+      const asked = r.asked || [];
+      return `<li><div class="h-h"><strong>Round ${r.round}</strong><span class="small">${esc(new Date(r.at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }))}</span><span class="sp"></span>${r.sha ? `<button class="ghost" data-round="${r.round}">Compare with now</button>` : ""}</div>
+        <div class="small">${r.kind === "approve" ? `Approved${r.pushed ? ` and pushed ${esc(r.pushed.sha)}` : ""}.` : asked.length ? `You asked for ${asked.length} ${asked.length === 1 ? "thing" : "things"}:` : "Sent with nothing to change."}${r.tests ? ` Tests: ${esc(r.tests)}.` : ""}${r.concerns ? ` ${r.concerns} review ${r.concerns === 1 ? "concern" : "concerns"}.` : ""}</div>
+        ${asked.length ? `<ul class="asked">${asked.slice(0, 6).map((x) => `<li>${inline(clip(String(x), 120))}</li>`).join("")}${asked.length > 6 ? `<li class="small">and ${asked.length - 6} more</li>` : ""}</ul>` : ""}
+        ${fs.existsSync(png) ? `<details><summary>Diagram then</summary><img class="diagram" alt="Diagram from round ${r.round}" src="${webview.asWebviewUri(vscode.Uri.file(png))}"></details>` : ""}</li>`;
+    })
+    .join("")}</ol>`;
 }
 
 /** Approve & push: commit only the reviewed files and push the branch, after a modal confirm. */
@@ -874,6 +938,8 @@ async function approveAndPush() {
     fb.verdict = "approve";
     fb.pushed = { sha, remote, branch: remoteBranch, at: new Date().toISOString() };
   });
+  saveFeedback((fb) => (fb.round = (fb.round || 0) + 1));
+  await snapshotRound(loadFeedback(), "approve");
   vscode.window.showInformationMessage(`Pushed ${sha} to ${remote}/${remoteBranch}.`);
   if (panel) panel.webview.html = renderHtml();
 }
@@ -885,18 +951,28 @@ function onHandback(msg) {
   if (msg.type === "send") {
     let todo = [];
     saveFeedback((fb) => {
-      todo = buildItems(fb)
-        .filter((i) => i.checked && !["skip", "keep"].includes(i.action))
-        .map(({ key, kind, label, status, file, line, text, url, action, note }) => ({ key, kind, from: label, status, file, line, text, url, action, note }));
+      todo = buildTodo(fb);
       fb.todo = todo;
       fb.verdict = todo.length ? "request-changes" : "approve";
       fb.remember = String(fb.context?.remember || "").split("\n").map((x) => x.trim()).filter(Boolean);
       fb.submittedAt = new Date().toISOString();
       fb.round = (fb.round || 0) + 1;
     });
+    snapshotRound(loadFeedback(), "send");
     const prompt = `Review handoff ready: read ${feedbackPath()} and act on it (${todo.length} item${todo.length === 1 ? "" : "s"}).`;
     vscode.env.clipboard.writeText(prompt);
     vscode.window.showInformationMessage(`Sent ${todo.length} item(s). Prompt copied: paste it into your agent session.`);
+    rerender();
+  }
+  if (msg.type === "stepVerdict") saveFeedback((fb) => ((fb.steps = fb.steps || {})[msg.key] = { v: msg.v, text: msg.text || "" }));
+  if (msg.type === "assessSend") saveFeedback((fb) => ((fb.assessSend = fb.assessSend || {})[msg.id] = msg.on));
+  if (msg.type === "step") {
+    const n = steps().length;
+    if (msg.to === "show") return openStep(loadFeedback().cursor || 0);
+    if (msg.to === "finish") return panel?.webview.postMessage({ type: "scroll", id: "finish" });
+    const i = Math.max(0, Math.min(n - 1, +msg.to));
+    saveFeedback((fb) => (fb.cursor = i));
+    openStep(i);
     rerender();
   }
 }
@@ -913,186 +989,143 @@ function prHtml() {
   ${disc ? `<details><summary>Conversation (${pr.discussion.length})</summary>${disc}</details>` : ""}`;
 }
 
-// ------------------------------------------------------------------ panes
+// ------------------------------------------------------------ review screen
+//
+// One screen, one job: get from "the agent says it's done" to "I understand it and
+// approved or corrected it". Top to bottom:
+//   summary · map of the change (each box is a step) · the current step with its why
+//   and only the concerns that sit in its code · finish (Send or Approve & push).
+// Long-form detail, the PR conversation and past rounds are folded away at the end.
 
-const words = (s) => String(s || "").split(/\s+/).filter(Boolean).length;
 const LEAD_WORDS = 70;
+const words = (s) => String(s || "").split(/\s+/).filter(Boolean).length;
 const when = (ms) => new Date(ms).toTimeString().slice(0, 5);
 
-/** One status line per check, for Overview and the tab badge. */
-function checkSummary() {
-  const out = [];
-  let must = 0;
-  for (const [id, r] of Object.entries(REVIEWERS)) {
+const QUESTIONS = [
+  ["why", "Why this change"],
+  ["approach", "Why this way"],
+  ["arch", "Architecture impact"],
+  ["simpler", "Could it be simpler"],
+  ["reuse", "Reuses existing code"],
+  ["dead", "Dead code"],
+  ["tests_missing", "Tests missing"],
+  ["tests_reuse", "Existing tests to extend"],
+  ["tests_worth", "Tests worth adding"],
+  ["scale", "Scale"],
+  ["maintain", "Maintenance"],
+];
+
+function readAssessment() {
+  const a = readCheck("assess");
+  if (!a) return null;
+  const byId = new Map((a.questions || []).map((q) => [q.id, q]));
+  a.rows = QUESTIONS.map(([id, label]) => ({ id, label, verdict: "unknown", answer: "Not answered.", ...byId.get(id) }));
+  return a;
+}
+
+function steps() {
+  return (current.analysis?.groups || []).map((g) => {
+    const note = current.review.notes.find((n) => `note:${n.id}` === g.key);
+    return { key: g.key, title: g.title, why: note?.body || "", detail: note?.detail || "", files: g.files, hunks: g.hunks, group: g, unexplained: g.hunks.filter((h) => !h.explained && !h.note).length };
+  });
+}
+
+/** Show one step's code: a single file opens at the first change, several open together. */
+async function openStep(i) {
+  const s = steps()[i];
+  if (!s) return;
+  if (s.files.length === 1) return openFile(s.files[0], s.hunks[0].start);
+  await vscode.commands.executeCommand("vscode.changes", `Step ${i + 1}: ${s.title}`, groupResources(s.group));
+}
+
+/** Every concern, placed on the step whose code it is about; the rest are global. */
+function placeConcerns(fb, st) {
+  const hit = (file, line) =>
+    file ? st.findIndex((s) => s.hunks.some((h) => h.file === file && (!line || (line >= h.start - 3 && line <= h.end + 3)))) : -1;
+  const per = st.map(() => []);
+  const global = [];
+  const put = (i, c) => (i >= 0 ? per[i] : global).push(c);
+  const send = fb.assessSend || {};
+  for (const r of readAssessment()?.rows || []) {
+    if (r.verdict !== "concern") continue;
+    const ref = (r.refs || [])[0] || "";
+    const [file, line] = [ref.split(":")[0], +ref.split(":")[1] || 0];
+    put(hit(file, line), { q: r.id, label: r.label, text: r.answer, detail: r.detail, on: send[r.id] !== false, hot: true });
+  }
+  for (const it of buildItems(fb)) {
+    if (!["pr", "check", "you"].includes(it.kind)) continue;
+    if (it.kind === "pr" && it.status !== "open" && !it.checked) continue;
+    if (it.kind === "check" && it.sev === "nit" && !it.checked) continue;
+    put(hit(it.file, it.line), { key: it.key, label: it.label, text: it.text, on: it.checked, hot: it.sev === "must" || it.status === "open" });
+  }
+  return { per, global };
+}
+
+function concernHtml(c) {
+  const attr = c.q ? `data-q="${esc(c.q)}"` : `data-key="${esc(c.key)}"`;
+  return `<label class="concern ${c.on ? "" : "off"}"><input type="checkbox" ${attr} ${c.on ? "checked" : ""} aria-label="send to the agent">
+    <span><span class="clabel ${c.hot ? "hot" : ""}">${esc(c.label)}</span> ${inline(clip(String(c.text).replace(/\n+/g, " "), 160))}${c.detail ? `<span class="cdetail">${inline(clip(String(c.detail), 240))}</span>` : ""}</span></label>`;
+}
+
+/** The map: every step as a box in reading order. It shows progress and where concerns are; click to go there. */
+function mapHtml(st, cur, verdicts, per) {
+  return `<ol class="map" aria-label="Steps of the change">${st
+    .map((s, i) => {
+      const v = verdicts[s.key]?.v;
+      const c = per[i].length;
+      const state = v === "ok" ? "looks good" : v === "change" ? "needs change" : v === "question" ? "question" : c ? `${c} ${c === 1 ? "concern" : "concerns"}` : `${s.files.length} ${s.files.length === 1 ? "file" : "files"}`;
+      return `<li><button class="node ${v || ""} ${i === cur ? "cur" : ""} ${c && !v ? "warn" : ""}" data-step="${i}" ${i === cur ? 'aria-current="step"' : ""}>
+        <span class="n">${i + 1}</span><span class="t">${esc(s.title)}</span><span class="s">${esc(state)}</span></button></li>`;
+    })
+    .join("")}</ol>`;
+}
+
+/** One line for all checks, with one button. */
+function checksLine() {
+  const ids = ["assess", ...Object.keys(REVIEWERS), "tests"];
+  const running = ids.filter((id) => jobState(id) === "running");
+  const failed = ids.filter((id) => jobState(id) === "failed");
+  const name = { assess: "review", codex: "Codex", goldfish: "Goldfish", ponytail: "Ponytail", tests: "tests" };
+  const parts = [];
+  const a = readAssessment();
+  if (a) {
+    const n = a.rows.filter((r) => r.verdict === "concern").length;
+    parts.push(`review: ${n ? `${n} ${n === 1 ? "concern" : "concerns"}` : "no concerns"}`);
+  }
+  for (const id of Object.keys(REVIEWERS)) {
     const c = readCheck(id);
-    const st = jobState(id);
-    if (st === "running") out.push(`${r.name}: running`);
-    else if (c) {
-      const m = c.findings.filter((f) => f.severity === "must").length;
-      must += m;
-      out.push(`${r.name}: ${c.findings.length ? `${c.findings.length} finding${c.findings.length === 1 ? "" : "s"}${m ? ` (${m} must fix)` : ""}` : "clean"}`);
-    }
+    if (c) parts.push(`${name[id]}: ${c.findings.length ? `${c.findings.length} ${c.findings.length === 1 ? "finding" : "findings"}` : "clean"}`);
   }
   const t = readJson(path.join(checksDir(), "tests.json"));
-  if (t?.running) out.push("tests: running");
-  else if (t) {
-    out.push(`tests: ${t.passed} passed${t.failed + t.errors ? `, ${t.failed + t.errors} failed` : ""}`);
-    must += t.failed + t.errors;
-  }
-  return { text: out.join(" · "), must };
+  if (t && !t.running) parts.push(`tests: ${t.passed} passed${t.failed + t.errors ? `, ${t.failed + t.errors} failed` : ""}`);
+  const since = Math.min(...running.map((id) => jobs.get(id).started));
+  const btn = running.length
+    ? `<span class="small"><span class="spin" aria-hidden="true"></span>Checking (${running.map((id) => name[id]).join(", ")}) <span class="elapsed" data-since="${since}"></span></span><button class="ghost" data-cancel="all">Cancel</button>`
+    : `<button class="${parts.length ? "ghost" : "primary"}" data-run="all">${parts.length ? "Re-run checks" : "Run checks"}</button>`;
+  const err = failed.map((id) => `<span class="jerr" role="alert">${name[id]} failed. <a data-log="${id}">Log</a></span>`).join(" ");
+  return `<div class="checks"><span class="small">${parts.length ? esc(parts.join(", ")) : "Checks find reuse, dead code, missing tests and bugs, and run your tests."}</span><span class="sp"></span>${btn}</div>${err ? `<div>${err}</div>` : ""}`;
 }
 
-/** The one thing to do now, so the user never has to work out where they are in the loop. */
-function nextStep(fb) {
-  const cs = checkSummary();
-  const ran = Object.keys(REVIEWERS).some((id) => readCheck(id)) || readJson(path.join(checksDir(), "tests.json"));
-  const ticked = buildItems(fb).filter((i) => i.checked && !["skip", "keep"].includes(i.action)).length;
-  if (fb.pushed) return { text: `Pushed ${fb.pushed.sha} to ${fb.pushed.remote}/${fb.pushed.branch}.`, tab: "", label: "" };
-  if (cs.must) return { text: `${cs.must} must-fix ${cs.must === 1 ? "finding" : "findings"} from checks.`, tab: "checks", label: "See checks" };
-  if (fb.submittedAt && fb.verdict === "request-changes" && Date.parse(fb.submittedAt) > current.mtime)
-    return { text: "Sent to the agent. This review updates when it writes a new one.", tab: "", label: "" };
-  if (!ran) return { text: "Read the diff, then run independent checks before you decide.", tab: "checks", label: "Run checks" };
-  if (ticked) return { text: `${ticked} ${ticked === 1 ? "item is" : "items are"} ticked for the agent.`, tab: "handback", label: "Hand back" };
-  return { text: "Nothing flagged. Approve and push, or tick items to send back.", tab: "handback", label: "Decide" };
-}
-
-function overviewHtml(review, fb) {
-  const [first] = review.sections;
-  const nx = nextStep(fb);
-  const notesPer = new Map();
-  for (const n of review.notes) notesPer.set(n.file, (notesPer.get(n.file) || 0) + 1);
-  let lead = "";
-  if (first) {
-    const long = words(first.body) > LEAD_WORDS;
-    lead = long
-      ? `<div class="lead">${mdHtml(first.body.split(/\s+/).slice(0, LEAD_WORDS).join(" ") + " …")}</div><div class="warn">The summary runs ${words(first.body)} words (limit ${LEAD_WORDS}). The rest is in <a data-tab="deep">Deep dive</a>.</div>`
-      : `<div class="lead">${mdHtml(first.body)}</div>`;
-  }
-  const gen = review.files.filter((f) => f.generated);
-  const files = review.files
-    .filter((f) => !f.generated)
-    .map(
-      (f) => `<li><a class="ref" data-file="${esc(f.path)}" data-line="1">${esc(path.basename(f.path))}</a>
-        ${notesPer.get(f.path) ? `<span class="pill">${notesPer.get(f.path)}</span>` : ""}
-        ${f.summary ? `<span class="sum">${inline(clip(f.summary, 60))}</span>` : f.unlisted ? `<span class="sum warnc">not mentioned by the agent</span>` : ""}</li>`
-    )
-    .join("");
-  const cs = checkSummary();
-  const qa = (review.qa || []).length;
-  const an = current.analysis;
-  const explained = an ? an.total - an.unexplained.length : 0;
-  const grp = an
-    ? `<h2>Changes, grouped <span class="small">${an.groups.length} ${an.groups.length === 1 ? "group" : "groups"} from ${an.total} hunks${an.graph ? ", linked by Graphify" : ""}</span></h2>
-      ${an.big ? `<div class="warn">Large change: ${an.lines} lines in ${an.sourceFiles} source files. Review one group at a time, or ask for smaller steps in <a data-tab="handback">Hand back</a>.</div>` : ""}
-      <ol class="groups">${an.groups
-        .map(
-          (g, i) => `<li><div class="g-h"><strong>${inline(g.title)}</strong><button class="ghost" data-group="${i}" title="Open only this group's diffs">Open</button></div>
-          <div class="g-refs">${g.hunks.map((h) => `<a class="ref" data-file="${esc(h.file)}" data-line="${h.start}">${esc(path.basename(h.file))}:${h.start}</a>${h.explained || !/\.(py|[jt]sx?|go|rs|java|kt|c|cc|cpp|h|hpp|rb|swift|cs|php|scala|sh)$/.test(h.file) ? "" : `<span class="nonote" title="No note explains this hunk">?</span>`}`).join(" ")}</div>
-          ${g.why.length > 1 ? `<div class="small">linked by ${g.why.slice(0, 3).map((w) => `<code>${esc(clip(w, 40))}</code>`).join(", ")}</div>` : ""}</li>`
-        )
-        .join("")}</ol>
-      <p class="small">${explained} of ${an.total} changed blocks are explained by a note.${an.unexplained.length ? ` The others are marked ? and listed in <a data-tab="handback">Hand back</a>.` : ""}${an.graph ? "" : ` <a data-graphify>Link groups by call graph with Graphify</a>`}</p>`
-    : "";
-  return `<div class="next"><span>${esc(nx.text)}</span>${nx.tab ? `<button class="primary" data-tab="${nx.tab}">${nx.label}</button>` : ""}</div>
-  ${lead}
-  ${grp}
-  <div class="how">Click into a change to open its note under the code. Reply there, or hover a line and click <strong>+</strong> to comment.</div>
-  <h2>Files</h2><ul class="files">${files}</ul>
-  ${gen.length ? `<details class="gen"><summary>Data and generated files (${gen.length}), left out of the diff view</summary><ul class="files">${gen
-    .map((f) => `<li><a class="ref" data-file="${esc(f.path)}" data-line="1">${esc(f.path)}</a> <span class="sum">${f.binary ? "binary" : `${f.lines} lines`}${f.summary ? `, ${inline(clip(f.summary, 60))}` : ""}</span></li>`)
-    .join("")}</ul></details>` : ""}
-  <h2>Checks</h2><p class="small">${cs.text ? inline(cs.text) : `None run yet. <a data-tab="checks">Run reviewers or tests</a>`}</p>
-  ${prHtml()}
-  ${review.sections.length > 1 || review.deepDive || qa ? `<p class="small">Why this approach, why not shorter, the tests, and your questions are in <a data-tab="deep">Deep dive</a>.</p>` : ""}`;
-}
-
-function deepHtml(review, fb) {
+function detailsHtml(review, fb) {
   const [, ...rest] = review.sections;
-  const sec = [...rest, ...(review.deepDive || [])]
-    .map((s) => `<details open><summary>${esc(s.heading)}</summary><div class="body">${mdHtml(s.body)}</div></details>`)
-    .join("");
-  const notes = [...review.notes]
-    .sort((a, b) => (review.order ? review.order.indexOf(a.id) - review.order.indexOf(b.id) : 0))
-    .map(
-      (n, i) => `<div class="walk"><div><span class="num">${i + 1}</span><strong>${esc(n.title || n.id)}</strong>
-        <a class="ref" data-file="${esc(n.file)}" data-line="${n.start}">${esc(path.basename(n.file))}:${n.start}</a></div>
-        ${mdHtml(n.body)}${n.detail ? mdHtml(n.detail) : ""}</div>`
-    )
-    .join("");
+  const sec = [...rest, ...(review.deepDive || [])].map((s) => `<h4>${esc(s.heading)}</h4>${mdHtml(s.body)}`).join("");
   const answered = new Set((review.qa || []).map((x) => x.q.trim()));
   const pending = (fb.questions || []).filter((x) => !answered.has(x.q.trim()));
   const qa = [
     ...(review.qa || []).map((x) => `<div class="qa"><div class="q">${inline(x.q)}</div>${mdHtml(x.a)}</div>`),
     ...pending.map((x) => `<div class="qa"><div class="q">${inline(x.q)}</div><p class="small">Waiting for the agent.</p></div>`),
   ].join("");
-  return `${sec || `<p class="small">The agent wrote no long-form sections.</p>`}
-  <h2>Walkthrough, in reading order</h2>${notes || `<p class="small">No notes.</p>`}
-  <h2>Ask about this change</h2>
-  ${qa}
-  <label class="lbl" for="q">Your question</label>
-  <textarea id="q" placeholder="e.g. What happens to callers that still expect a str? Why not do this in the gateway?"></textarea>
-  <div class="row"><button class="primary" id="ask">Ask the agent</button></div>
-  <div class="small">Questions go to your own agent session, which has the context. The answer appears here.</div>`;
-}
-
-function diagramHtml(webview) {
-  const dir = path.join(current.root, ".review");
-  const png = path.join(dir, "diagram.png");
-  const has = fs.existsSync(png);
-  const st = jobState("diagram");
-  const editor = !!vscode.extensions.getExtension(EXCALIDRAW_EXT);
-  const img = has ? `<img class="diagram" alt="Diagram of the change" src="${webview.asWebviewUri(vscode.Uri.file(png))}?v=${fs.statSync(png).mtimeMs}">` : "";
-  return `${img || `<p class="small">No diagram yet. The excalidraw-diagram skill draws the change as before and after flow, with the real function names, and renders it to PNG.</p>`}
-  <div class="row">
-    <button class="primary" data-run="diagram" ${st === "running" ? "disabled" : ""}>${st === "running" ? "Drawing…" : has ? "Redraw" : "Draw diagram"}</button>
-    ${has ? `<button data-dg="png">Open full size</button>` : ""}
-    ${fs.existsSync(path.join(dir, "diagram.excalidraw")) ? (editor ? `<button data-dg="excalidraw">Edit in Excalidraw</button>` : `<button data-dg="install">Get the Excalidraw editor</button>`) : ""}
-  </div>
-  <div class="small">Runs a fresh Claude session in a terminal, so it doesn't use your main session's context.</div>`;
-}
-
-function checksHtml(fb) {
-  const cards = Object.entries(REVIEWERS)
-    .map(([id, r]) => {
-      const c = readCheck(id);
-      const st = jobState(id);
-      const missing = r.plugin && plugins && !plugins.has(r.plugin.id);
-      const list = (c?.findings || [])
-        .map(
-          (f) => `<div class="finding"><span class="tag check ${f.severity === "must" ? "hot" : ""}">${SEV[f.severity]}</span>
-          ${f.file ? `<a class="ref" data-file="${esc(f.file)}" data-line="${f.line || 1}">${esc(path.basename(f.file))}:${f.line || 1}</a>` : ""}
-          <div><strong>${inline(f.title || "")}</strong></div><div class="small">${inline(clip(String(f.body || ""), 400))}</div></div>`
-        )
-        .join("");
-      const status = st === "running" ? "running…" : c ? `ran ${when(c.mtime)} · ${c.findings.length ? `${c.findings.length} finding${c.findings.length === 1 ? "" : "s"}` : "no findings"}` : "not run";
-      return `<div class="card"><div class="card-h"><strong>${r.name}</strong> <span class="small">${status}</span>
-        <span class="sp"></span>
-        ${missing ? `<button data-install="${id}">Install ${r.plugin.label}</button>` : ""}
-        <button data-run="${id}" ${st === "running" || (missing && id === "ponytail") ? "disabled" : ""}>${c ? "Re-run" : "Run"}</button></div>
-        <div class="small">${esc(r.blurb)}${missing ? ` ${esc(r.plugin.without)}` : ""}</div>
-        ${c?.summary ? `<p>${inline(c.summary)}</p>` : ""}${list}</div>`;
-    })
-    .join("");
-
-  const t = readJson(path.join(checksDir(), "tests.json"));
-  const tests = { ...(t?.targets ? { targets: t.targets } : {}), ...(current.review.tests || {}) };
-  const off = new Set(fb.testsOff || []);
-  const st = jobState("tests");
-  const targets = (tests.targets || [])
-    .map((x) => `<label class="tgt"><input type="checkbox" data-target="${esc(x)}" ${off.has(x) ? "" : "checked"}> <code>${esc(x)}</code></label>`)
-    .join("");
-  const result = t && !t.running
-    ? `<p><strong>${t.passed} passed</strong>${t.failed + t.errors ? `, <strong class="bad">${t.failed + t.errors} failed</strong>` : ""}${t.skipped ? `, ${t.skipped} skipped` : ""} <span class="small">· ${esc(t.where || "")} · ${esc(String(t.ranAt || "").slice(11, 16))}</span></p>
-       ${(t.failures || []).map((f) => `<div class="finding"><code>${esc(f.test)}</code><pre>${esc(f.message)}</pre></div>`).join("")}
-       ${t.tail ? `<details><summary>Output</summary><pre>${esc(t.tail)}</pre></details>` : ""}`
-    : "";
-  const testCard = `<div class="card"><div class="card-h"><strong>Tests on Modal CPU</strong> <span class="small">${st === "running" ? "running…" : t ? "" : "not run"}</span><span class="sp"></span>
-      <button data-run="tests" ${st === "running" || !targets ? "disabled" : ""}>${t ? "Re-run" : "Run"}</button></div>
-      <div class="small">Only the ticked targets run, never the full suite. ${tests.why ? inline(tests.why) : ""}</div>
-      ${targets || `<p class="small">The agent listed no test targets (review.json "tests").</p>`}${result}</div>`;
-
-  return `<div class="next"><span>Each check runs in its own terminal, where you can watch it and approve tool use. Findings appear here, inline in the diff, and in Hand back.</span><button class="primary" data-run="all">Run all checks</button></div>
-  ${cards}${testCard}`;
+  const an = current.analysis;
+  const gen = review.files.filter((f) => f.generated);
+  const unlisted = review.files.filter((f) => f.unlisted && !f.generated);
+  return `${sec}
+    ${unlisted.length ? `<h4>Changed but not mentioned by the agent</h4><p>${unlisted.map((f) => `<a class="ref" data-file="${esc(f.path)}" data-line="1">${esc(f.path)}</a>`).join(", ")}</p>` : ""}
+    ${gen.length ? `<h4>Data and generated files, left out of the diff</h4><p class="small">${gen.map((f) => `<a class="ref" data-file="${esc(f.path)}" data-line="1">${esc(path.basename(f.path))}</a>`).join(", ")}</p>` : ""}
+    <h4>Ask about this change</h4>${qa}
+    <textarea id="q" aria-label="Your question" placeholder="Goes to your agent session, which has the context."></textarea>
+    <div class="row"><button id="ask">Ask</button></div>
+    ${prHtml()}
+    <h4>More</h4><p class="small"><a data-run="diagram">Export a diagram (Excalidraw)</a>${an && !an.graph ? ` · <a data-graphify>Sharpen the map with Graphify</a>` : ""}</p>`;
 }
 
 function renderHtml() {
@@ -1101,162 +1134,190 @@ function renderHtml() {
   const webview = panel.webview;
   webview.options = { enableScripts: true, localResourceRoots: [vscode.Uri.file(path.join(current.root, ".review"))] };
   const nonce = crypto.randomBytes(16).toString("hex");
-  const cs = checkSummary();
-  const panes = { overview: overviewHtml(review, fb), deep: deepHtml(review, fb), diagram: diagramHtml(webview), checks: checksHtml(fb), handback: handbackHtml(fb) };
-  const tabs = [
-    ["overview", "Overview", ""],
-    ["deep", "Deep dive", ""],
-    ["diagram", "Diagram", ""],
-    ["checks", "Checks", cs.must ? String(cs.must) : ""],
-    ["handback", "Hand back", String(lastItems.filter((i) => i.checked && !["skip", "keep"].includes(i.action)).length || "")],
-  ];
-  const strip = taskStrip();
+
+  const [first] = review.sections;
+  const lead = first ? (words(first.body) > LEAD_WORDS ? first.body.split(/\s+/).slice(0, LEAD_WORDS).join(" ") + " …" : first.body) : "";
+  const st = steps();
+  const verdicts = fb.steps || {};
+  const cur = Math.min(Math.max(0, fb.cursor || 0), Math.max(0, st.length - 1));
+  const { per, global } = placeConcerns(fb, st);
+  const done = st.filter((s) => verdicts[s.key]?.v).length;
+  const s = st[cur];
+  const v = s ? verdicts[s.key] || {} : {};
+
+  const step = s
+    ? `<article class="step" aria-live="polite">
+        <div class="step-h"><span class="small">Step ${cur + 1} of ${st.length}</span><span class="sp"></span><span class="small">${done} of ${st.length} reviewed</span></div>
+        <h2>${inline(s.title)}</h2>
+        ${s.why ? mdHtml(s.why) : `<p class="small">No explanation from the agent for this part.</p>`}
+        <p class="files">${s.files.map((f) => `<a class="ref" data-file="${esc(f)}" data-line="${s.hunks.find((h) => h.file === f).start}">${esc(path.basename(f))}</a>`).join(", ")}${s.unexplained ? ` <span class="warnc">${s.unexplained} unexplained ${s.unexplained === 1 ? "part" : "parts"}</span>` : ""}</p>
+        ${per[cur].length ? `<div class="concerns">${per[cur].map(concernHtml).join("")}</div>` : ""}
+        ${s.detail ? `<details><summary>More</summary>${mdHtml(s.detail)}</details>` : ""}
+        <div class="verdict" role="group" aria-label="Your verdict">
+          <button class="v ${v.v === "ok" ? "on" : ""}" data-v2="ok" title="g">Looks good</button>
+          <button class="v ${v.v === "change" ? "on" : ""}" data-v2="change" title="c">Needs change</button>
+          <button class="v ${v.v === "question" ? "on" : ""}" data-v2="question" title="q">Question</button>
+          <span class="sp"></span>
+          <button class="ghost" data-step="${cur - 1}" ${cur ? "" : "disabled"} title="k">Back</button>
+          <button class="primary" data-step="${cur + 1 < st.length ? cur + 1 : "finish"}" title="j">${cur + 1 < st.length ? "Next" : "Finish"}</button>
+        </div>
+        <textarea id="vtext" class="${v.v && v.v !== "ok" ? "" : "hidden"}" aria-label="Your note" placeholder="${v.v === "question" ? "What do you want to know?" : "What should change?"}">${esc(v.text || "")}</textarea>
+      </article>`
+    : `<p class="small">No code changes against ${esc(review.base)}.</p>`;
+
+  const todoN = buildTodo(fb).length;
+  const ctx = fb.context || {};
+  const rs = rounds();
+  const finish = `<section id="finish">
+    ${global.length ? `<div class="concerns">${global.map(concernHtml).join("")}</div>` : ""}
+    <textarea class="ctx" data-k="instructions" aria-label="Anything else for the agent" placeholder="Anything else for the agent?">${esc(ctx.instructions || "")}</textarea>
+    <div class="row">${todoN ? `<button class="primary" id="send">Send ${todoN} to agent</button>` : ""}<button class="${todoN ? "" : "primary"}" data-v="approve" title="Commit the reviewed files and push this branch (asks first)">Approve &amp; push</button>
+      <span class="sp"></span><span class="small">${fb.pushed ? `Pushed ${esc(fb.pushed.sha)}.` : fb.submittedAt ? `Sent ${esc(fb.submittedAt.slice(11, 16))}.` : ""}</span></div>
+    <details class="mem"><summary>Remember for next time</summary><textarea class="ctx" data-k="remember" aria-label="Remember for next time" placeholder="One per line. Saved to the agent's memory.">${esc(ctx.remember || "")}</textarea></details>
+  </section>`;
 
   return `<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
 <style>
-  body { font-family: var(--vscode-font-family); font-size: 13px; color: var(--vscode-foreground); padding: 0 16px 32px; line-height: 1.5; }
-  h1 { font-size: 15px; margin: 10px 0 2px; }
-  h4 { font-size: 13px; margin: 10px 0 4px; }
-  p, ul, ol { margin: 6px 0; } ul, ol { padding-left: 18px; } li { margin: 2px 0; }
-  .meta { color: var(--vscode-descriptionForeground); font-size: 12px; margin-bottom: 6px; }
-  .how { font-size: 12px; color: var(--vscode-descriptionForeground); background: var(--vscode-textBlockQuote-background); border-left: 2px solid var(--vscode-focusBorder); padding: 6px 8px; margin: 10px 0; }
-  .warn { font-size: 12px; border-left: 2px solid var(--vscode-editorWarning-foreground); padding: 2px 8px; margin: 6px 0; color: var(--vscode-descriptionForeground); }
-  code { font-family: var(--vscode-editor-font-family); font-size: 12px; background: var(--vscode-textCodeBlock-background); padding: 0 3px; border-radius: 3px; }
-  pre { background: var(--vscode-textCodeBlock-background); padding: 6px 8px; overflow-x: auto; border-radius: 4px; font-size: 12px; white-space: pre-wrap; }
-  pre code { background: none; padding: 0; }
-  table { border-collapse: collapse; margin: 6px 0; font-size: 12px; }
-  th, td { border: 1px solid var(--vscode-panel-border); padding: 2px 6px; text-align: left; vertical-align: top; }
-  a { color: var(--vscode-textLink-foreground); cursor: pointer; text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  h2 { font-size: 12px; font-weight: 600; margin: 20px 0 6px; }
-  .meta { display: flex; flex-wrap: wrap; gap: 2px 14px; }
-  .next { display: flex; align-items: center; gap: 12px; justify-content: space-between; padding: 8px 10px; margin: 4px 0 10px; border-radius: 4px; background: var(--vscode-textBlockQuote-background); font-size: 12px; }
-  .next button { flex: none; }
-  .warnc { color: var(--vscode-editorWarning-foreground); }
-  details.gen > summary { font-weight: 400; font-size: 12px; color: var(--vscode-descriptionForeground); }
-  .groups { padding-left: 18px; margin: 4px 0; } .groups li { margin: 0 0 8px; }
-  .g-h { display: flex; align-items: center; gap: 8px; } .g-h strong { flex: 1; }
-  button.ghost { background: none; color: var(--vscode-textLink-foreground); padding: 2px 6px; }
-  .g-refs { font-size: 12px; line-height: 1.7; }
-  .nonote { font-size: 10px; font-weight: 600; color: var(--vscode-editorWarning-foreground); margin-left: 1px; vertical-align: super; }
-  .item.off .ctl { display: none; }
-  .lbl { display: block; font-size: 12px; font-weight: 600; margin: 14px 0 4px; }
-  button:active:not(:disabled) { transform: translateY(1px); }
-  @media (prefers-reduced-motion: reduce) { button:active:not(:disabled) { transform: none; } }
-  h3 { font-size: 12px; margin: 14px 0 4px; }
-  details { border-top: 1px solid var(--vscode-panel-border); padding: 6px 0; }
-  summary { cursor: pointer; font-weight: 600; }
-  .body { padding: 2px 0 4px 2px; }
-  .files { list-style: none; padding: 0; } .files li { margin: 3px 0; }
-  .sum { color: var(--vscode-descriptionForeground); font-size: 12px; margin-left: 6px; }
-  .pill { font-size: 11px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); border-radius: 8px; padding: 0 6px; margin-left: 4px; }
-  textarea { width: 100%; box-sizing: border-box; min-height: 48px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); font-family: inherit; font-size: 13px; padding: 6px; resize: vertical; }
-  .row { display: flex; gap: 6px; margin: 8px 0 4px; flex-wrap: wrap; }
-  button { border: 0; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+  body { font-family: var(--vscode-font-family); font-size: 13px; color: var(--vscode-foreground); background: var(--vscode-editor-background); padding: 0 18px 40px; line-height: 1.5; max-width: 760px; }
+  h1 { font-size: 15px; margin: 0; } h2 { font-size: 14px; margin: 2px 0 4px; } h4 { font-size: 12px; margin: 14px 0 4px; }
+  p, ul, ol { margin: 4px 0; } ul, ol { padding-left: 18px; }
+  a { color: var(--vscode-textLink-foreground); cursor: pointer; text-decoration: none; } a:hover { text-decoration: underline; }
+  code { font-family: var(--vscode-editor-font-family); font-size: 12px; background: var(--vscode-textCodeBlock-background); padding: 0 3px; border-radius: 4px; }
+  pre { background: var(--vscode-textCodeBlock-background); padding: 6px 8px; border-radius: 4px; font-size: 12px; white-space: pre-wrap; } pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; font-size: 12px; margin: 6px 0; } th, td { border: 1px solid var(--vscode-panel-border); padding: 2px 6px; text-align: left; }
+  .small { font-size: 12px; color: var(--vscode-descriptionForeground); }
+  .sp { flex: 1; }
+  .top { display: flex; align-items: center; gap: 8px; padding: 12px 0 2px; }
+  .chip { font-size: 11px; padding: 2px 9px; border-radius: 999px; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+  .chip.on { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+  .lead { margin: 6px 0 10px; color: var(--vscode-foreground); }
+  button { font: inherit; font-size: 12px; border: 0; border-radius: 4px; padding: 4px 12px; cursor: pointer; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); white-space: nowrap; }
   button.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-  button:disabled { opacity: .5; cursor: default; }
-  button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+  button.ghost { background: none; color: var(--vscode-textLink-foreground); padding: 4px 6px; }
+  button:disabled { opacity: .45; cursor: default; }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  :focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+  textarea { width: 100%; box-sizing: border-box; min-height: 46px; margin-top: 8px; padding: 6px 8px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 4px; font: inherit; resize: vertical; }
+  .hidden { display: none !important; }
+  .row { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+  .map { list-style: none; padding: 0; margin: 4px 0 6px; display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; }
+  .node { width: 100%; height: 100%; text-align: left; display: grid; grid-template-columns: 18px 1fr; grid-template-rows: auto auto; column-gap: 4px; padding: 6px 8px 6px 7px; white-space: normal; border-radius: 4px; border: 1px solid var(--vscode-panel-border); border-left: 3px solid transparent; background: var(--vscode-editorWidget-background, transparent); color: var(--vscode-foreground); }
+  .node:hover { border-color: var(--vscode-descriptionForeground); }
+  .node.cur { border-color: var(--vscode-focusBorder); box-shadow: inset 0 0 0 1px var(--vscode-focusBorder); }
+  .node .n { grid-row: span 2; font-size: 11px; color: var(--vscode-descriptionForeground); padding-top: 1px; }
+  .node .t { font-size: 12px; font-weight: 600; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .node .s { font-size: 11px; color: var(--vscode-descriptionForeground); }
+  .node.ok { border-left-color: var(--vscode-testing-iconPassed, #3fb950); } .node.ok .s { color: var(--vscode-testing-iconPassed, #3fb950); }
+  .node.change, .node.question, .node.warn { border-left-color: var(--vscode-editorWarning-foreground); }
+  .node.change .s, .node.question .s, .node.warn .s { color: var(--vscode-editorWarning-foreground); }
+  .checks { display: flex; align-items: center; gap: 8px; margin: 4px 0 12px; min-height: 26px; }
+  .spin { display: inline-block; width: 9px; height: 9px; margin-right: 6px; border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: rot .8s linear infinite; vertical-align: -1px; }
+  @keyframes rot { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation: none; } button:active:not(:disabled) { transform: none; } }
+  .jerr { font-size: 12px; color: var(--vscode-errorForeground); margin-right: 8px; }
+  .step { border: 1px solid var(--vscode-panel-border); border-radius: 4px; padding: 10px 14px 12px; }
+  .step-h { display: flex; }
+  .files { font-size: 12px; margin-top: 6px; }
+  .warnc { color: var(--vscode-editorWarning-foreground); font-size: 12px; }
+  .concerns { margin: 8px 0 4px; display: flex; flex-direction: column; gap: 4px; }
+  .concern { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; padding: 6px 8px; border-radius: 4px; background: var(--vscode-textBlockQuote-background); }
+  .concern.off { opacity: .55; } .concern input { margin-top: 2px; }
+  .clabel { font-weight: 600; } .clabel.hot { color: var(--vscode-editorWarning-foreground); }
+  .cdetail { display: block; color: var(--vscode-descriptionForeground); margin-top: 2px; }
+  .verdict { display: flex; gap: 6px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  .verdict .v.on { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+  #finish { margin-top: 18px; padding-top: 10px; border-top: 1px solid var(--vscode-panel-border); }
+  details { margin-top: 6px; } summary { cursor: pointer; font-size: 12px; color: var(--vscode-descriptionForeground); }
+  details.fold { border-top: 1px solid var(--vscode-panel-border); padding-top: 8px; margin-top: 14px; }
+  details.fold > summary { font-size: 12px; font-weight: 600; color: var(--vscode-foreground); }
+  .qa { border-left: 2px solid var(--vscode-focusBorder); padding: 2px 8px; margin: 6px 0; } .q { font-weight: 600; }
   .disc { border-top: 1px solid var(--vscode-panel-border); padding: 4px 0; font-size: 12px; } .who { font-weight: 600; }
-  .small { font-size: 11px; color: var(--vscode-descriptionForeground); }
-  .tabs { position: sticky; top: 0; z-index: 2; background: var(--vscode-editor-background); display: flex; gap: 2px; border-bottom: 1px solid var(--vscode-panel-border); margin: 0 -16px 8px; padding: 0 12px; }
-  .tab { background: none; color: var(--vscode-descriptionForeground); border-radius: 0; padding: 7px 8px 6px; border-bottom: 2px solid transparent; font-size: 12px; }
-  .tab.on { color: var(--vscode-foreground); border-bottom-color: var(--vscode-focusBorder); }
-  .tab .b { font-size: 10px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); border-radius: 8px; padding: 0 5px; margin-left: 4px; }
-  .pane { display: none; } .pane.on { display: block; }
-  .strip { display: flex; gap: 4px; overflow-x: auto; padding: 8px 0 2px; align-items: center; } .strip .sp { flex: 1; }
-  .task { font-size: 11px; padding: 2px 10px; border-radius: 999px; white-space: nowrap; }
-  .task.on { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-  .item { display: flex; gap: 8px; align-items: flex-start; padding: 6px 0; border-bottom: 1px solid var(--vscode-panel-border); font-size: 12px; }
-  .item.off { opacity: .55; } .item input.on { margin-top: 3px; }
-  .item-main { flex: 1; min-width: 0; }
-  .item .first { margin: 2px 0 4px; overflow-wrap: anywhere; }
-  .why { color: var(--vscode-descriptionForeground); font-style: italic; font-size: 11px; margin-bottom: 4px; }
-  .done { color: var(--vscode-testing-iconPassed, #3fb950); font-size: 11px; margin-bottom: 4px; }
-  .grp > summary { font-size: 12px; }
-  .ctl { display: flex; gap: 6px; }
-  select, input.note { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); font-size: 12px; padding: 2px 4px; }
-  input.note { flex: 1; min-width: 0; }
-  .tag { font-size: 11px; border-radius: 8px; padding: 0 6px; margin-right: 6px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
-  .tag.hot { background: var(--vscode-statusBarItem-warningBackground, #b58900); color: var(--vscode-statusBarItem-warningForeground, #fff); }
-  .tag.you { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-  .card { border: 1px solid var(--vscode-panel-border); border-radius: 4px; padding: 8px 10px; margin: 10px 0; }
-  .card-h { display: flex; align-items: center; gap: 8px; } .sp { flex: 1; }
-  .finding { border-top: 1px solid var(--vscode-panel-border); padding: 6px 0; font-size: 12px; }
-  .tgt { display: block; font-size: 12px; margin: 2px 0; }
-  .bad { color: var(--vscode-testing-iconFailed, #f85149); }
-  .walk { border-top: 1px solid var(--vscode-panel-border); padding: 6px 0; }
-  .walk .ref { margin-left: 6px; font-size: 12px; }
-  .num { display: inline-block; min-width: 16px; font-size: 11px; color: var(--vscode-descriptionForeground); }
-  .qa { border-left: 2px solid var(--vscode-focusBorder); padding: 2px 8px; margin: 8px 0; } .q { font-weight: 600; }
-  img.diagram { max-width: 100%; border-radius: 4px; background: #fff; margin: 8px 0; cursor: zoom-in; }
+  .hist { list-style: none; padding: 0; } .hist > li { padding: 6px 0; border-bottom: 1px solid var(--vscode-panel-border); }
+  .h-h { display: flex; align-items: baseline; gap: 10px; } .asked { margin: 2px 0; font-size: 12px; }
+  img.diagram { max-width: 100%; border-radius: 4px; background: #fff; }
 </style></head><body>
-${strip}
-<h1>${esc(review.title || "Review")}</h1>
-<div class="meta"><span>against <code>${esc(/^[0-9a-f]{40}$/.test(review.base) ? review.base.slice(0, 7) : review.base)}</code></span><span>${review.files.length} files</span><span>${review.notes.length} notes</span><span><span id="count">${countComments(fb)}</span> comments from you</span>${fb.verdict ? `<span><strong>${fb.verdict === "approve" ? "approved" : "changes requested"}</strong></span>` : ""}</div>
-<nav class="tabs" role="tablist">${tabs.map(([id, label, b]) => `<button class="tab" role="tab" aria-controls="pane-${id}" id="tab-${id}" data-tab="${id}">${label}${b ? `<span class="b">${esc(b)}</span>` : ""}</button>`).join("")}</nav>
-${Object.entries(panes).map(([id, html]) => `<section class="pane" id="pane-${id}" role="tabpanel">${html}</section>`).join("")}
+<div class="top"><h1>${esc(review.title || "Review")}</h1><span class="sp"></span>${taskStrip()}</div>
+${lead ? `<div class="lead">${mdHtml(lead)}</div>` : ""}
+${st.length ? mapHtml(st, cur, verdicts, per) : ""}
+${checksLine()}
+${step}
+${finish}
+<details class="fold"><summary>Details</summary>${detailsHtml(review, fb)}</details>
+${rs.length ? `<details class="fold"><summary>History (${rs.length} ${rs.length === 1 ? "round" : "rounds"})</summary>${historyHtml(webview)}</details>` : ""}
 <script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
+  const STEP_KEY = ${JSON.stringify(s ? s.key : "")};
+  const post = (m) => vscode.postMessage(m);
   const state = vscode.getState() || {};
-  const show = (id) => {
-    document.querySelectorAll('.tab').forEach((t) => { t.classList.toggle('on', t.dataset.tab === id); t.setAttribute('aria-selected', t.dataset.tab === id); t.tabIndex = t.dataset.tab === id ? 0 : -1; });
-    document.querySelectorAll('.pane').forEach((p) => p.classList.toggle('on', p.id === 'pane-' + id));
-    vscode.setState({ ...vscode.getState(), tab: id });
-  };
-  show(state.tab || 'overview');
-  document.querySelector('.tabs').addEventListener('keydown', (e) => {
-    const ids = [...document.querySelectorAll('.tab')].map((t) => t.dataset.tab);
-    const i = ids.indexOf(vscode.getState().tab);
-    const j = e.key === 'ArrowRight' ? (i + 1) % ids.length : e.key === 'ArrowLeft' ? (i + ids.length - 1) % ids.length : -1;
-    if (j >= 0) { show(ids[j]); document.getElementById('tab-' + ids[j]).focus(); }
-  });
   window.scrollTo(0, state.scroll || 0);
-  addEventListener('scroll', () => vscode.setState({ ...vscode.getState(), scroll: scrollY }));
+  addEventListener('scroll', () => vscode.setState({ ...vscode.getState(), scroll: scrollY }), { passive: true });
+  const tick = () => document.querySelectorAll('.elapsed').forEach((el) => { const s = Math.floor((Date.now() - +el.dataset.since) / 1000); el.textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); });
+  tick(); setInterval(tick, 1000);
   document.addEventListener('click', (e) => {
-    const tab = e.target.closest('[data-tab]');
-    if (tab) return show(tab.dataset.tab);
-    const ext = e.target.closest('a.ext');
-    if (ext) return vscode.postMessage({ type: 'external', url: ext.dataset.url });
-    if (e.target.closest('#refresh-pr')) return vscode.postMessage({ type: 'refreshPr' });
-    const ref = e.target.closest('a.ref');
-    if (ref) return vscode.postMessage({ type: 'open', file: ref.dataset.file, line: +ref.dataset.line });
-    const task = e.target.closest('[data-root]');
-    if (task) return vscode.postMessage({ type: 'switchTask', root: task.dataset.root });
-    if (e.target.closest('[data-tasks]')) return vscode.postMessage({ type: 'tasks' });
-    if (e.target.closest('[data-summon]')) return vscode.postMessage({ type: 'summon' });
-    const grp = e.target.closest('[data-group]');
-    if (grp) return vscode.postMessage({ type: 'group', i: +grp.dataset.group });
-    if (e.target.closest('[data-graphify]')) return vscode.postMessage({ type: 'graphify' });
-    const run = e.target.closest('[data-run]');
-    if (run) { run.disabled = true; run.textContent = 'Starting…'; return vscode.postMessage({ type: 'run', id: run.dataset.run }); }
-    const inst = e.target.closest('[data-install]');
-    if (inst) return vscode.postMessage({ type: 'install', id: inst.dataset.install });
-    const dg = e.target.closest('[data-dg]');
-    if (dg) return vscode.postMessage({ type: 'diagramOpen', what: dg.dataset.dg });
-    if (e.target.closest('img.diagram')) return vscode.postMessage({ type: 'diagramOpen', what: 'png' });
-    const v = e.target.closest('button[data-v]');
-    if (v) return vscode.postMessage({ type: 'verdict', verdict: v.dataset.v });
-    if (e.target.closest('#send')) return vscode.postMessage({ type: 'send' });
-    if (e.target.closest('#ask')) { const q = document.getElementById('q'); vscode.postMessage({ type: 'ask', q: q.value }); q.value = ''; }
+    const t = e.target;
+    const ext = t.closest('a.ext'); if (ext) return post({ type: 'external', url: ext.dataset.url });
+    if (t.closest('#refresh-pr')) return post({ type: 'refreshPr' });
+    const ref = t.closest('a.ref'); if (ref) return post({ type: 'open', file: ref.dataset.file, line: +ref.dataset.line });
+    const task = t.closest('[data-root]'); if (task) return post({ type: 'switchTask', root: task.dataset.root });
+    if (t.closest('[data-tasks]')) return post({ type: 'tasks' });
+    if (t.closest('[data-summon]')) return post({ type: 'summon' });
+    if (t.closest('[data-graphify]')) return post({ type: 'graphify' });
+    const rnd = t.closest('[data-round]'); if (rnd) return post({ type: 'round', n: +rnd.dataset.round });
+    const cancel = t.closest('[data-cancel]'); if (cancel) return post({ type: 'cancel', id: cancel.dataset.cancel });
+    const lg = t.closest('[data-log]'); if (lg) return post({ type: 'log', id: lg.dataset.log });
+    const run = t.closest('[data-run]'); if (run) { if (run.tagName === 'BUTTON') { run.disabled = true; run.textContent = 'Starting…'; } return post({ type: 'run', id: run.dataset.run }); }
+    const v2 = t.closest('[data-v2]');
+    if (v2) {
+      const box = document.getElementById('vtext');
+      document.querySelectorAll('[data-v2]').forEach((b) => b.classList.toggle('on', b === v2));
+      box.classList.toggle('hidden', v2.dataset.v2 === 'ok');
+      box.placeholder = v2.dataset.v2 === 'question' ? 'What do you want to know?' : 'What should change?';
+      if (v2.dataset.v2 !== 'ok') box.focus();
+      return post({ type: 'stepVerdict', key: STEP_KEY, v: v2.dataset.v2, text: box.value });
+    }
+    const stp = t.closest('[data-step]'); if (stp && !stp.disabled) return post({ type: 'step', to: stp.dataset.step });
+    if (t.closest('button[data-v]')) return post({ type: 'verdict', verdict: 'approve' });
+    if (t.closest('#send')) return post({ type: 'send' });
+    if (t.closest('#ask')) { const q = document.getElementById('q'); post({ type: 'ask', q: q.value }); q.value = ''; }
   });
-  document.querySelectorAll('[data-target]').forEach((c) => c.addEventListener('change', () => vscode.postMessage({ type: 'testOn', target: c.dataset.target, on: c.checked })));
   const timers = {};
   const later = (k, f) => { clearTimeout(timers[k]); timers[k] = setTimeout(f, 350); };
-  const sendItem = (el) => {
-    el.classList.toggle('off', !el.querySelector('.on').checked);
-    vscode.postMessage({ type: 'plan', key: el.dataset.key, on: el.querySelector('.on').checked, action: el.querySelector('.act').value, note: el.querySelector('.note').value });
-  };
-  document.querySelectorAll('.item').forEach((el) => {
-    el.querySelector('.on').addEventListener('change', () => sendItem(el));
-    el.querySelector('.act').addEventListener('change', () => { el.querySelector('.on').checked = true; sendItem(el); });
-    el.querySelector('.note').addEventListener('input', () => later(el.dataset.key, () => { el.querySelector('.on').checked = true; sendItem(el); }));
+  const vt = document.getElementById('vtext');
+  if (vt) vt.addEventListener('input', () => later('vtext', () => { const on = document.querySelector('[data-v2].on'); post({ type: 'stepVerdict', key: STEP_KEY, v: on ? on.dataset.v2 : 'change', text: vt.value }); }));
+  document.querySelectorAll('.concern input').forEach((c) => c.addEventListener('change', () => {
+    c.closest('.concern').classList.toggle('off', !c.checked);
+    if (c.dataset.q) post({ type: 'assessSend', id: c.dataset.q, on: c.checked });
+    else post({ type: 'plan', key: c.dataset.key, on: c.checked, action: 'fix', note: '' });
+  }));
+  document.querySelectorAll('textarea.ctx').forEach((t) => t.addEventListener('input', () => later(t.dataset.k, () => post({ type: 'ctx', k: t.dataset.k, text: t.value }))));
+  document.addEventListener('keydown', (e) => {
+    if (e.target.closest('textarea, input, select') || e.metaKey || e.ctrlKey || e.altKey) return;
+    const sel = { j: '.verdict .primary', k: '.verdict .ghost[data-step]', g: '[data-v2="ok"]', c: '[data-v2="change"]', q: '[data-v2="question"]' }[e.key];
+    if (sel) { e.preventDefault(); document.querySelector(sel)?.click(); }
   });
-  document.querySelectorAll('textarea.ctx').forEach((t) => t.addEventListener('input', () => later(t.dataset.k, () => vscode.postMessage({ type: 'ctx', k: t.dataset.k, text: t.value }))));
-  window.addEventListener('message', ({ data }) => {
-    if (data.type === 'count') document.getElementById('count').textContent = data.n;
-  });
+  window.addEventListener('message', ({ data }) => { if (data.type === 'scroll') document.getElementById(data.id)?.scrollIntoView({ behavior: 'smooth' }); });
 </script></body></html>`;
+}
+
+/** Everything the user flagged, as the agent's to-do list. */
+function buildTodo(fb) {
+  const todo = [];
+  const verdicts = fb.steps || {};
+  for (const s of steps()) {
+    const v = verdicts[s.key];
+    if (!v || !["change", "question"].includes(v.v)) continue;
+    todo.push({ key: `step:${s.key}`, kind: "step", from: "you", file: s.files[0], line: s.hunks[0].start, files: s.files, text: `${s.title}${v.text ? `: ${v.text}` : ""}`, action: v.v === "change" ? "change" : "answer", note: v.text || "" });
+  }
+  const a = readAssessment();
+  const send = fb.assessSend || {};
+  for (const r of a?.rows || [])
+    if (r.verdict === "concern" && send[r.id] !== false)
+      todo.push({ key: `assess:${r.id}`, kind: "review", from: "review", file: (r.refs || [])[0]?.split(":")[0], line: +((r.refs || [])[0]?.split(":")[1] || 0), text: `${r.label}: ${r.answer}`, action: "fix", note: r.detail || "" });
+  for (const i of buildItems(fb))
+    if ((i.kind === "pr" || i.kind === "check" || i.kind === "you") && i.checked)
+      todo.push({ key: i.key, kind: i.kind, from: i.label, status: i.status, file: i.file, line: i.line, text: i.text, url: i.url, action: i.action === "skip" ? "fix" : i.action, note: i.note });
+  return todo;
 }
 
 // --------------------------------------------------------------- activate
@@ -1334,6 +1395,8 @@ function activate(context) {
     addCheckThreads();
     rerender();
   };
+  jobStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 49);
+  context.subscriptions.push(jobStatus, { dispose: () => jobs.forEach((j) => j.running && j.child.kill()) });
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
   status.text = "$(tasklist) Tasks";
   status.tooltip = "Review Handoff: tasks board";
@@ -1349,7 +1412,6 @@ function activate(context) {
     outputs.onDidCreate(onOutput),
     outputs.onDidChange(onOutput),
     vscode.window.onDidCloseTerminal((t) => {
-      for (const j of jobs.values()) if (j.terminal === t) j.closed = true;
       if ([...jobs.entries()].some(([k, j]) => k.startsWith("install:") && j.terminal === t)) detectPlugins();
       rerender();
     }),

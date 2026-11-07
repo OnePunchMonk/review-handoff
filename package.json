@@ -3,7 +3,7 @@
   "displayName": "Review Handoff",
   "description": "Review what coding agents change before it ships: grouped diffs with the why inline, independent reviewers, tests on Modal, and a checklist you hand back to Claude Code or Codex.",
   "publisher": "onepunchmonk",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "license": "MIT",
   "repository": {
     "type": "git",
